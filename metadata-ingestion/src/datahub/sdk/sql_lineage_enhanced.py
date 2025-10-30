@@ -1,21 +1,22 @@
 """
-Enhanced SQL lineage utilities with CTE expansion and alias resolution.
+Enhanced SQL lineage utilities with CTE expansion and alias resolution - IMPROVED VERSION.
 
 This module provides advanced transformation logic extraction that:
+- Extracts CTEs from optimized SQL (including sqlglot's internal CTEs)
 - Expands CTE column references to their actual calculations
 - Replaces table aliases with full table URNs
-- Recursively processes nested CTEs
-- Provides readable transformation logic even for complex queries
+- Suppresses sqlglot optimizer warnings
+- Provides readable transformation logic even for complex correlated subqueries
 """
 
 from __future__ import annotations
 
 import logging
-import re
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import sqlglot
 import sqlglot.expressions as exp
+import sqlglot.optimizer
 
 import datahub.metadata.schema_classes as models
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
@@ -34,6 +35,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Suppress sqlglot optimizer warnings
+sqlglot_logger = logging.getLogger("sqlglot")
+original_sqlglot_level = sqlglot_logger.level
+
 _empty_audit_stamp = models.AuditStampClass(
     time=0,
     actor=DEFAULT_ACTOR_URN,
@@ -49,27 +54,19 @@ class CTEDefinition:
         self.column_mappings = column_mappings  # output_col -> calculation
 
 
-def extract_cte_definitions(
-    sql: str,
-    platform: str,
-    override_dialect: Optional[str] = None,
+def extract_ctes_from_optimized_sql(
+    statement: sqlglot.exp.Expression,
+    dialect: sqlglot.Dialect,
 ) -> Dict[str, CTEDefinition]:
     """
-    Extract CTE definitions from SQL query.
+    Extract CTE definitions from an optimized SQL statement.
 
-    Returns a mapping of CTE name -> CTEDefinition with column calculations.
+    This captures both explicit CTEs and internal CTEs created by sqlglot's optimizer
+    when it converts correlated subqueries.
     """
-    dialect = get_dialect(override_dialect or platform)
-
-    try:
-        statement = sqlglot.parse_one(sql, dialect=dialect)
-    except Exception as e:
-        logger.debug(f"Failed to parse SQL for CTE extraction: {e}")
-        return {}
-
     ctes = {}
 
-    # Find all CTEs in the query
+    # Find all CTEs in the optimized statement
     for cte in statement.find_all(exp.CTE):
         cte_name = cte.alias
         if not cte_name:
@@ -87,8 +84,13 @@ def extract_cte_definitions(
             for select_col in cte_query.expressions:
                 col_name = select_col.alias_or_name
                 if col_name and col_name != "*":
-                    # Get the SQL expression for this column
-                    col_expr = select_col.this if isinstance(select_col, exp.Alias) else select_col
+                    # Get the expression for this column
+                    if isinstance(select_col, exp.Alias):
+                        col_expr = select_col.this
+                    else:
+                        col_expr = select_col
+
+                    # Store the calculation
                     column_mappings[col_name] = col_expr.sql(dialect=dialect)
 
         ctes[cte_name] = CTEDefinition(
@@ -97,22 +99,46 @@ def extract_cte_definitions(
             column_mappings=column_mappings,
         )
 
+    # Also look for derived tables in JOINs (these are like inline CTEs)
+    for join in statement.find_all(exp.Join):
+        if isinstance(join.this, exp.Subquery):
+            subquery_alias = join.this.alias
+            subquery_expr = join.this.this
+
+            if subquery_alias and isinstance(subquery_expr, exp.Select):
+                column_mappings = {}
+                for select_col in subquery_expr.expressions:
+                    col_name = select_col.alias_or_name
+                    if col_name and col_name != "*":
+                        if isinstance(select_col, exp.Alias):
+                            col_expr = select_col.this
+                        else:
+                            col_expr = select_col
+
+                        column_mappings[col_name] = col_expr.sql(dialect=dialect)
+
+                # Store as a "virtual CTE"
+                ctes[subquery_alias] = CTEDefinition(
+                    name=subquery_alias,
+                    select_expression=subquery_expr.sql(dialect=dialect),
+                    column_mappings=column_mappings,
+                )
+
     return ctes
 
 
-def expand_cte_references(
+def expand_cte_references_recursively(
     transformation_logic: str,
     cte_definitions: Dict[str, CTEDefinition],
     dialect: sqlglot.Dialect,
+    max_depth: int = 5,
 ) -> str:
     """
-    Expand CTE column references in transformation logic to their actual calculations.
+    Recursively expand CTE column references to their actual calculations.
 
-    Example:
-        Input:  COALESCE("pha"."avg_price_30d", "p"."base_price")
-        Output: COALESCE(AVG("ph"."new_price"), "p"."base_price")
+    This handles nested CTEs where one CTE references another.
     """
-    if not cte_definitions:
+    if not cte_definitions or max_depth <= 0:
         return transformation_logic
 
     # Parse the transformation logic
@@ -122,65 +148,63 @@ def expand_cte_references(
         logger.debug(f"Failed to parse transformation logic for CTE expansion: {e}")
         return transformation_logic
 
-    # Track if we made any changes
     changed = False
 
-    # Find all column references in the expression
-    for col_ref in expr.find_all(exp.Column):
+    # Find all column references
+    for col_ref in list(expr.find_all(exp.Column)):
         table_alias = col_ref.table
         col_name = col_ref.name
 
-        # Check if this references a CTE
-        if table_alias in cte_definitions:
+        # Check if this references a CTE (including internal ones like _u_0, _u_1)
+        if table_alias and table_alias in cte_definitions:
             cte_def = cte_definitions[table_alias]
 
-            # Check if we have the column definition
             if col_name in cte_def.column_mappings:
-                # Replace the column reference with the actual calculation
                 calculation = cte_def.column_mappings[col_name]
 
-                # Parse the calculation to create a proper expression node
                 try:
                     calc_expr = sqlglot.parse_one(f"SELECT {calculation}", dialect=dialect)
-                    # Get just the expression part (not the SELECT wrapper)
                     if isinstance(calc_expr, exp.Select) and calc_expr.expressions:
                         replacement_expr = calc_expr.expressions[0]
 
-                        # Replace the column node with the calculation expression
+                        # Remove alias if present
+                        if isinstance(replacement_expr, exp.Alias):
+                            replacement_expr = replacement_expr.this
+
+                        # Replace the column reference
                         col_ref.replace(replacement_expr.copy())
                         changed = True
                 except Exception as e:
-                    logger.debug(f"Failed to parse CTE calculation for {table_alias}.{col_name}: {e}")
+                    logger.debug(f"Failed to expand CTE reference {table_alias}.{col_name}: {e}")
 
-    if changed:
-        # Extract just the expression part (remove the SELECT wrapper)
-        if isinstance(expr, exp.Select) and expr.expressions:
-            result = expr.expressions[0].sql(dialect=dialect)
-        else:
-            result = expr.sql(dialect=dialect)
+    # Extract the result
+    if isinstance(expr, exp.Select) and expr.expressions:
+        result = expr.expressions[0]
 
-        # Clean up the result
-        if result.endswith(" AS " + transformation_logic.split()[-1]):
-            # Remove trailing AS clause if present
-            result = result[: result.rfind(" AS ")]
+        # Remove any alias
+        if isinstance(result, exp.Alias):
+            result = result.this
 
-        return result
+        result_sql = result.sql(dialect=dialect)
+    else:
+        result_sql = expr.sql(dialect=dialect)
 
-    return transformation_logic
+    # If we made changes, recursively expand again (for nested CTEs)
+    if changed and max_depth > 1:
+        return expand_cte_references_recursively(
+            result_sql, cte_definitions, dialect, max_depth - 1
+        )
+
+    return result_sql
 
 
-def replace_table_aliases_with_urns(
+def replace_table_aliases_with_names(
     transformation_logic: str,
     table_alias_to_urn_mapping: Dict[str, str],
     dialect: sqlglot.Dialect,
 ) -> str:
     """
-    Replace table aliases in transformation logic with readable table names from URNs.
-
-    Example:
-        Input:  "p"."base_price"
-        Mapping: {"p": "urn:li:dataset:(...raw_products,PROD)"}
-        Output: raw_products.base_price
+    Replace table aliases with readable table names from URNs.
     """
     if not table_alias_to_urn_mapping:
         return transformation_logic
@@ -197,74 +221,25 @@ def replace_table_aliases_with_urns(
         if table_alias and table_alias in table_alias_to_urn_mapping:
             urn_str = table_alias_to_urn_mapping[table_alias]
 
-            # Extract table name from URN
-            # URN format: urn:li:dataset:(urn:li:dataPlatform:postgres,ecommerce.public.raw_products,PROD)
             try:
                 dataset_urn = DatasetUrn.from_string(urn_str)
-                # Get just the table name (last part after last dot or the whole name)
+                # Extract just the table name
                 table_name_parts = dataset_urn.name.split(".")
                 table_name = table_name_parts[-1] if table_name_parts else dataset_urn.name
-
-                # Replace the table alias with the actual table name
                 col_ref.set("table", table_name)
             except Exception:
-                # If URN parsing fails, just use the URN string
                 pass
 
-    # Extract the expression
+    # Extract result
     if isinstance(expr, exp.Select) and expr.expressions:
-        result = expr.expressions[0].sql(dialect=dialect, pretty=False)
+        result = expr.expressions[0]
+        if isinstance(result, exp.Alias):
+            result = result.this
+        result_sql = result.sql(dialect=dialect)
     else:
-        result = expr.sql(dialect=dialect, pretty=False)
+        result_sql = expr.sql(dialect=dialect)
 
-    # Remove any trailing AS clause
-    if " AS " in result:
-        result = result[: result.rfind(" AS ")]
-
-    return result
-
-
-def enhance_transformation_logic(
-    transformation_logic: str,
-    sql: str,
-    platform: str,
-    table_alias_to_urn_mapping: Optional[Dict[str, str]] = None,
-    override_dialect: Optional[str] = None,
-) -> str:
-    """
-    Enhance transformation logic by expanding CTEs and replacing aliases.
-
-    This function takes the raw transformation logic (which may contain CTE
-    references and table aliases) and produces a more readable version.
-
-    Args:
-        transformation_logic: The raw transformation logic string
-        sql: The original SQL query (to extract CTE definitions)
-        platform: The platform (for dialect detection)
-        table_alias_to_urn_mapping: Mapping of table aliases to URNs
-        override_dialect: Optional dialect override
-
-    Returns:
-        Enhanced transformation logic with CTEs expanded and aliases replaced
-    """
-    dialect = get_dialect(override_dialect or platform)
-
-    # Step 1: Extract CTE definitions
-    cte_definitions = extract_cte_definitions(sql, platform, override_dialect)
-
-    # Step 2: Expand CTE references
-    if cte_definitions:
-        transformation_logic = expand_cte_references(
-            transformation_logic, cte_definitions, dialect
-        )
-
-    # Step 3: Replace table aliases with readable names
-    if table_alias_to_urn_mapping:
-        transformation_logic = replace_table_aliases_with_urns(
-            transformation_logic, table_alias_to_urn_mapping, dialect
-        )
-
-    return transformation_logic
+    return result_sql
 
 
 def infer_lineage_from_sql_with_enhanced_transformation_logic(
@@ -279,14 +254,16 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
     override_dialect: Optional[str] = None,
     expand_ctes: bool = True,
     replace_aliases: bool = True,
+    suppress_warnings: bool = True,
 ) -> None:
     """
     Add lineage with enhanced transformation logic that expands CTEs and replaces aliases.
 
-    This function extends the basic transformation logic preservation by:
-    1. Expanding CTE column references to their actual calculations
-    2. Replacing table aliases with readable table names
-    3. Providing fully expanded transformation expressions
+    This improved version:
+    - Extracts CTEs from the OPTIMIZED SQL (including sqlglot's internal CTEs)
+    - Recursively expands nested CTE references
+    - Replaces table aliases with readable names
+    - Suppresses sqlglot optimizer warnings
 
     Args:
         graph: DataHubGraph or DataHubClient instance
@@ -298,215 +275,252 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
         default_schema: Default schema name
         override_dialect: Optional dialect override
         expand_ctes: Whether to expand CTE references (default: True)
-        replace_aliases: Whether to replace table aliases with full names (default: True)
-
-    Example:
-        ```python
-        # Original transformation logic:
-        # COALESCE("pha"."avg_price_30d", "p"."base_price")
-
-        # Enhanced transformation logic:
-        # COALESCE(AVG(raw_price_history.new_price), raw_products.base_price)
-        ```
+        replace_aliases: Whether to replace table aliases (default: True)
+        suppress_warnings: Whether to suppress sqlglot warnings (default: True)
     """
     from datahub.sql_parsing.sqlglot_lineage import create_lineage_sql_parsed_result
 
-    # Handle both DataHubClient and DataHubGraph
-    if isinstance(graph, DataHubClient):
-        actual_graph = graph._graph
-    else:
-        actual_graph = graph
+    # Suppress sqlglot warnings if requested
+    if suppress_warnings:
+        sqlglot_logger.setLevel(logging.ERROR)
 
-    # Parse the SQL query
-    parsed_result: SqlParsingResult = create_lineage_sql_parsed_result(
-        query=query_text,
-        default_db=default_db,
-        default_schema=default_schema,
-        platform=platform,
-        platform_instance=platform_instance,
-        env=env,
-        graph=actual_graph,
-        override_dialect=override_dialect,
-    )
+    try:
+        # Handle both DataHubClient and DataHubGraph
+        if isinstance(graph, DataHubClient):
+            actual_graph = graph._graph
+        else:
+            actual_graph = graph
 
-    # Handle parsing errors
-    if parsed_result.debug_info.table_error:
-        raise SdkUsageError(
-            f"Failed to parse SQL query: {parsed_result.debug_info.error}"
-        )
-    elif parsed_result.debug_info.column_error:
-        logger.warning(
-            f"Failed to parse column-level lineage from SQL query: {parsed_result.debug_info.error}",
+        # Parse the SQL query
+        parsed_result: SqlParsingResult = create_lineage_sql_parsed_result(
+            query=query_text,
+            default_db=default_db,
+            default_schema=default_schema,
+            platform=platform,
+            platform_instance=platform_instance,
+            env=env,
+            graph=actual_graph,
+            override_dialect=override_dialect,
         )
 
-    if not parsed_result.out_tables:
-        raise SdkUsageError(
-            "No output tables found in the query. Cannot establish lineage."
-        )
+        # Handle parsing errors
+        if parsed_result.debug_info.table_error:
+            raise SdkUsageError(
+                f"Failed to parse SQL query: {parsed_result.debug_info.error}"
+            )
+        elif parsed_result.debug_info.column_error:
+            logger.warning(
+                f"Failed to parse column-level lineage: {parsed_result.debug_info.error}",
+            )
 
-    downstream_urn = parsed_result.out_tables[0]
+        if not parsed_result.out_tables:
+            raise SdkUsageError(
+                "No output tables found in the query. Cannot establish lineage."
+            )
 
-    # Create query URN and entity
-    query_urn = QueryUrn(generate_hash(query_text)).urn()
-    from datahub.sql_parsing.sql_parsing_aggregator import make_query_subjects
+        downstream_urn = parsed_result.out_tables[0]
 
-    fields_involved = OrderedSet([str(downstream_urn)])
-    for upstream_table in parsed_result.in_tables:
-        if upstream_table != downstream_urn:
-            fields_involved.add(str(upstream_table))
-
-    if parsed_result.column_lineage:
-        for col_lineage in parsed_result.column_lineage:
-            if col_lineage.downstream and col_lineage.downstream.column:
-                downstream_field = SchemaFieldUrn(
-                    downstream_urn, col_lineage.downstream.column
-                ).urn()
-                fields_involved.add(downstream_field)
-
-            for upstream_ref in col_lineage.upstreams:
-                if upstream_ref.table and upstream_ref.column:
-                    upstream_field = SchemaFieldUrn(
-                        upstream_ref.table, upstream_ref.column
-                    ).urn()
-                    fields_involved.add(upstream_field)
-
-    query_entity = MetadataChangeProposalWrapper.construct_many(
-        query_urn,
-        aspects=[
-            models.QueryPropertiesClass(
-                statement=models.QueryStatementClass(
-                    value=query_text,
-                    language=models.QueryLanguageClass.SQL,
-                ),
-                source=models.QuerySourceClass.SYSTEM,
-                created=_empty_audit_stamp,
-                lastModified=_empty_audit_stamp,
-            ),
-            make_query_subjects(list(fields_involved)),
-        ],
-    )
-
-    # Build table alias to URN mapping for alias replacement
-    table_alias_to_urn: Dict[str, str] = {}
-    if replace_aliases:
-        # We need to parse the SQL again to get table aliases
+        # Get the optimized statement to extract CTEs from
         dialect = get_dialect(override_dialect or platform)
+
+        # Parse and optimize the SQL to get internal CTEs
+        statement = sqlglot.parse_one(query_text, dialect=dialect)
+
+        # Apply the same optimizations that DataHub's parser uses
+        optimized_statement = sqlglot.optimizer.qualify.qualify(
+            statement.copy(),
+            dialect=dialect,
+            catalog=default_db,
+            db=default_schema,
+            qualify_columns=False,
+            validate_qualify_columns=False,
+            allow_partial_qualification=True,
+            identify=False,
+        )
+
+        # Now optimize with unnest_subqueries to create internal CTEs
         try:
-            statement = sqlglot.parse_one(query_text, dialect=dialect)
-
-            # Find all table references and their aliases
-            for table_ref in statement.find_all(exp.Table):
-                table_alias = table_ref.alias_or_name
-                table_name = table_ref.name
-
-                # Try to match this table to one of our URNs
-                for urn in parsed_result.in_tables:
-                    if table_name.lower() in urn.lower():
-                        table_alias_to_urn[table_alias] = urn
-                        break
+            optimized_statement = sqlglot.optimizer.unnest_subqueries.unnest_subqueries(
+                optimized_statement,
+                dialect=dialect,
+            )
         except Exception as e:
-            logger.debug(f"Failed to extract table aliases: {e}")
+            logger.debug(f"Failed to unnest subqueries: {e}")
 
-    # Process each upstream table
-    for upstream_table in parsed_result.in_tables:
-        if upstream_table == downstream_urn:
-            continue
+        # Extract CTE definitions from the optimized statement
+        cte_definitions = {}
+        if expand_ctes:
+            cte_definitions = extract_ctes_from_optimized_sql(optimized_statement, dialect)
+            logger.debug(f"Extracted {len(cte_definitions)} CTE definitions: {list(cte_definitions.keys())}")
 
-        fine_grained_lineages: List[models.FineGrainedLineageClass] = []
+        # Build table alias to URN mapping
+        table_alias_to_urn: Dict[str, str] = {}
+        if replace_aliases:
+            try:
+                for table_ref in statement.find_all(exp.Table):
+                    table_alias = table_ref.alias_or_name
+                    table_name = table_ref.name
+
+                    for urn in parsed_result.in_tables:
+                        if table_name.lower() in urn.lower():
+                            table_alias_to_urn[table_alias] = urn
+                            break
+            except Exception as e:
+                logger.debug(f"Failed to extract table aliases: {e}")
+
+        # Create query entity
+        query_urn = QueryUrn(generate_hash(query_text)).urn()
+        from datahub.sql_parsing.sql_parsing_aggregator import make_query_subjects
+
+        fields_involved = OrderedSet([str(downstream_urn)])
+        for upstream_table in parsed_result.in_tables:
+            if upstream_table != downstream_urn:
+                fields_involved.add(str(upstream_table))
 
         if parsed_result.column_lineage:
             for col_lineage in parsed_result.column_lineage:
-                if not (col_lineage.downstream and col_lineage.downstream.column):
-                    continue
+                if col_lineage.downstream and col_lineage.downstream.column:
+                    downstream_field = SchemaFieldUrn(
+                        downstream_urn, col_lineage.downstream.column
+                    ).urn()
+                    fields_involved.add(downstream_field)
 
-                upstream_refs = [
-                    ref
-                    for ref in col_lineage.upstreams
-                    if ref.table == upstream_table and ref.column
-                ]
+                for upstream_ref in col_lineage.upstreams:
+                    if upstream_ref.table and upstream_ref.column:
+                        upstream_field = SchemaFieldUrn(
+                            upstream_ref.table, upstream_ref.column
+                        ).urn()
+                        fields_involved.add(upstream_field)
 
-                if not upstream_refs:
-                    continue
-
-                # Extract and enhance transformation logic
-                transform_operation = None
-                if col_lineage.logic:
-                    raw_logic = col_lineage.logic.column_logic
-
-                    # Enhance the transformation logic
-                    if expand_ctes or replace_aliases:
-                        try:
-                            enhanced_logic = enhance_transformation_logic(
-                                transformation_logic=raw_logic,
-                                sql=query_text,
-                                platform=platform,
-                                table_alias_to_urn_mapping=table_alias_to_urn if replace_aliases else None,
-                                override_dialect=override_dialect,
-                            )
-                        except Exception as e:
-                            logger.debug(f"Failed to enhance transformation logic: {e}")
-                            enhanced_logic = raw_logic
-                    else:
-                        enhanced_logic = raw_logic
-
-                    # Format the transformation operation
-                    if col_lineage.logic.is_direct_copy:
-                        transform_operation = f"COPY: {enhanced_logic}"
-                    else:
-                        transform_operation = f"SQL: {enhanced_logic}"
-
-                fine_grained_lineages.append(
-                    models.FineGrainedLineageClass(
-                        upstreamType=models.FineGrainedLineageUpstreamTypeClass.FIELD_SET,
-                        upstreams=[
-                            SchemaFieldUrn(upstream_table, ref.column).urn()
-                            for ref in upstream_refs
-                        ],
-                        downstreamType=models.FineGrainedLineageDownstreamTypeClass.FIELD,
-                        downstreams=[
-                            SchemaFieldUrn(
-                                downstream_urn, col_lineage.downstream.column
-                            ).urn()
-                        ],
-                        transformOperation=transform_operation,
-                        query=query_urn,
-                        confidenceScore=parsed_result.debug_info.confidence,
-                    )
-                )
-
-        # Build dataset patch
-        updater = DatasetPatchBuilder(str(downstream_urn))
-        updater.add_upstream_lineage(
-            models.UpstreamClass(
-                dataset=str(upstream_table),
-                type=models.DatasetLineageTypeClass.TRANSFORMED,
-                query=query_urn,
-            )
+        query_entity = MetadataChangeProposalWrapper.construct_many(
+            query_urn,
+            aspects=[
+                models.QueryPropertiesClass(
+                    statement=models.QueryStatementClass(
+                        value=query_text,
+                        language=models.QueryLanguageClass.SQL,
+                    ),
+                    source=models.QuerySourceClass.SYSTEM,
+                    created=_empty_audit_stamp,
+                    lastModified=_empty_audit_stamp,
+                ),
+                make_query_subjects(list(fields_involved)),
+            ],
         )
 
-        for fgl in fine_grained_lineages:
-            updater.add_fine_grained_upstream_lineage(fgl)
+        # Process each upstream table
+        for upstream_table in parsed_result.in_tables:
+            if upstream_table == downstream_urn:
+                continue
 
-        if not actual_graph.exists(updater.urn):
-            logger.warning(
-                f"Dataset {updater.urn} does not exist. Creating lineage anyway."
+            fine_grained_lineages: List[models.FineGrainedLineageClass] = []
+
+            if parsed_result.column_lineage:
+                for col_lineage in parsed_result.column_lineage:
+                    if not (col_lineage.downstream and col_lineage.downstream.column):
+                        continue
+
+                    upstream_refs = [
+                        ref
+                        for ref in col_lineage.upstreams
+                        if ref.table == upstream_table and ref.column
+                    ]
+
+                    if not upstream_refs:
+                        continue
+
+                    # Extract and enhance transformation logic
+                    transform_operation = None
+                    if col_lineage.logic:
+                        raw_logic = col_lineage.logic.column_logic
+                        enhanced_logic = raw_logic
+
+                        # Step 1: Expand CTE references
+                        if expand_ctes and cte_definitions:
+                            try:
+                                enhanced_logic = expand_cte_references_recursively(
+                                    enhanced_logic,
+                                    cte_definitions,
+                                    dialect,
+                                    max_depth=5,
+                                )
+                            except Exception as e:
+                                logger.debug(f"Failed to expand CTEs: {e}")
+
+                        # Step 2: Replace table aliases
+                        if replace_aliases and table_alias_to_urn:
+                            try:
+                                enhanced_logic = replace_table_aliases_with_names(
+                                    enhanced_logic,
+                                    table_alias_to_urn,
+                                    dialect,
+                                )
+                            except Exception as e:
+                                logger.debug(f"Failed to replace aliases: {e}")
+
+                        # Format the transformation operation
+                        if col_lineage.logic.is_direct_copy:
+                            transform_operation = f"COPY: {enhanced_logic}"
+                        else:
+                            transform_operation = f"SQL: {enhanced_logic}"
+
+                    fine_grained_lineages.append(
+                        models.FineGrainedLineageClass(
+                            upstreamType=models.FineGrainedLineageUpstreamTypeClass.FIELD_SET,
+                            upstreams=[
+                                SchemaFieldUrn(upstream_table, ref.column).urn()
+                                for ref in upstream_refs
+                            ],
+                            downstreamType=models.FineGrainedLineageDownstreamTypeClass.FIELD,
+                            downstreams=[
+                                SchemaFieldUrn(
+                                    downstream_urn, col_lineage.downstream.column
+                                ).urn()
+                            ],
+                            transformOperation=transform_operation,
+                            query=query_urn,
+                            confidenceScore=parsed_result.debug_info.confidence,
+                        )
+                    )
+
+            # Build dataset patch
+            updater = DatasetPatchBuilder(str(downstream_urn))
+            updater.add_upstream_lineage(
+                models.UpstreamClass(
+                    dataset=str(upstream_table),
+                    type=models.DatasetLineageTypeClass.TRANSFORMED,
+                    query=query_urn,
+                )
             )
 
-        mcps: List[
-            Union[
-                MetadataChangeProposalWrapper,
-                models.MetadataChangeProposalClass,
-            ]
-        ] = list(updater.build())
+            for fgl in fine_grained_lineages:
+                updater.add_fine_grained_upstream_lineage(fgl)
 
-        actual_graph.emit_mcps(mcps)
+            if not actual_graph.exists(updater.urn):
+                logger.warning(
+                    f"Dataset {updater.urn} does not exist. Creating lineage anyway."
+                )
 
-    # Emit query entity
-    if query_entity:
-        actual_graph.emit_mcps(query_entity)
+            mcps: List[
+                Union[
+                    MetadataChangeProposalWrapper,
+                    models.MetadataChangeProposalClass,
+                ]
+            ] = list(updater.build())
 
-    logger.info(
-        f"Successfully created enhanced lineage for {downstream_urn} "
-        f"with {len(parsed_result.in_tables)} upstream table(s) "
-        f"and {len(parsed_result.column_lineage or [])} column lineage relationship(s)"
-    )
+            actual_graph.emit_mcps(mcps)
+
+        # Emit query entity
+        if query_entity:
+            actual_graph.emit_mcps(query_entity)
+
+        logger.info(
+            f"Successfully created enhanced lineage for {downstream_urn} "
+            f"with {len(parsed_result.in_tables)} upstream table(s) "
+            f"and {len(parsed_result.column_lineage or [])} column lineage relationship(s)"
+        )
+
+    finally:
+        # Restore original logging level
+        if suppress_warnings:
+            sqlglot_logger.setLevel(original_sqlglot_level)

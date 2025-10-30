@@ -111,6 +111,7 @@ def main():
             default_schema="public",
             expand_ctes=True,        # Expand internal CTEs from correlated subqueries
             replace_aliases=True,    # Replace table aliases (p, ph, oi, o) with full names
+            suppress_warnings=True,  # Suppress "Unknown subquery scope" warnings
         )
 
         print("✓ Lineage created successfully!")
