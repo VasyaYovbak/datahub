@@ -155,12 +155,16 @@ def expand_cte_references_recursively(
         table_alias = col_ref.table
         col_name = col_ref.name
 
+        logger.debug(f"    Found reference: {table_alias}.{col_name}")
+
         # Check if this references a CTE (including internal ones like _u_0, _u_1)
         if table_alias and table_alias in cte_definitions:
             cte_def = cte_definitions[table_alias]
+            logger.debug(f"      → CTE '{table_alias}' found, has columns: {list(cte_def.column_mappings.keys())}")
 
             if col_name in cte_def.column_mappings:
                 calculation = cte_def.column_mappings[col_name]
+                logger.debug(f"      → Expanding '{col_name}' to: {calculation}")
 
                 try:
                     calc_expr = sqlglot.parse_one(f"SELECT {calculation}", dialect=dialect)
@@ -174,8 +178,14 @@ def expand_cte_references_recursively(
                         # Replace the column reference
                         col_ref.replace(replacement_expr.copy())
                         changed = True
+                        logger.debug(f"      ✅ Replaced successfully")
                 except Exception as e:
-                    logger.debug(f"Failed to expand CTE reference {table_alias}.{col_name}: {e}")
+                    logger.debug(f"      ❌ Failed to expand: {e}")
+            else:
+                logger.debug(f"      ⚠️ Column '{col_name}' not found in CTE '{table_alias}'")
+        else:
+            if table_alias:
+                logger.debug(f"      ⚠️ Table '{table_alias}' is not a CTE")
 
     # Extract the result
     if isinstance(expr, exp.Select) and expr.expressions:
@@ -351,7 +361,13 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
         cte_definitions = {}
         if expand_ctes:
             cte_definitions = extract_ctes_from_optimized_sql(optimized_statement, dialect)
-            logger.debug(f"Extracted {len(cte_definitions)} CTE definitions: {list(cte_definitions.keys())}")
+            logger.info(f"🔍 Extracted {len(cte_definitions)} CTE definitions: {list(cte_definitions.keys())}")
+
+            # Debug: Show CTE contents
+            for cte_name, cte_def in cte_definitions.items():
+                logger.info(f"  CTE '{cte_name}' columns: {list(cte_def.column_mappings.keys())}")
+                for col_name, col_expr in cte_def.column_mappings.items():
+                    logger.info(f"    {col_name} = {col_expr[:100]}..." if len(col_expr) > 100 else f"    {col_name} = {col_expr}")
 
         # Build table alias to URN mapping
         table_alias_to_urn: Dict[str, str] = {}
@@ -435,6 +451,9 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
                         raw_logic = col_lineage.logic.column_logic
                         enhanced_logic = raw_logic
 
+                        logger.info(f"\n📊 Processing column: {col_lineage.downstream.column}")
+                        logger.info(f"  Raw logic: {raw_logic}")
+
                         # Step 1: Expand CTE references
                         if expand_ctes and cte_definitions:
                             try:
@@ -444,19 +463,28 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
                                     dialect,
                                     max_depth=5,
                                 )
+                                if enhanced_logic != raw_logic:
+                                    logger.info(f"  After CTE expansion: {enhanced_logic}")
+                                else:
+                                    logger.info(f"  ⚠️ CTE expansion: no changes made")
                             except Exception as e:
-                                logger.debug(f"Failed to expand CTEs: {e}")
+                                logger.warning(f"  ❌ Failed to expand CTEs: {e}")
 
                         # Step 2: Replace table aliases
                         if replace_aliases and table_alias_to_urn:
                             try:
+                                before_alias_replacement = enhanced_logic
                                 enhanced_logic = replace_table_aliases_with_names(
                                     enhanced_logic,
                                     table_alias_to_urn,
                                     dialect,
                                 )
+                                if enhanced_logic != before_alias_replacement:
+                                    logger.info(f"  After alias replacement: {enhanced_logic}")
                             except Exception as e:
-                                logger.debug(f"Failed to replace aliases: {e}")
+                                logger.warning(f"  ❌ Failed to replace aliases: {e}")
+
+                        logger.info(f"  ✅ Final: {enhanced_logic}")
 
                         # Format the transformation operation
                         if col_lineage.logic.is_direct_copy:
