@@ -81,17 +81,25 @@ def extract_ctes_from_optimized_sql(
         column_mappings = {}
 
         if isinstance(cte_query, exp.Select):
-            for select_col in cte_query.expressions:
+            for idx, select_col in enumerate(cte_query.expressions):
                 col_name = select_col.alias_or_name
-                if col_name and col_name != "*":
-                    # Get the expression for this column
-                    if isinstance(select_col, exp.Alias):
-                        col_expr = select_col.this
-                    else:
-                        col_expr = select_col
 
-                    # Store the calculation
-                    column_mappings[col_name] = col_expr.sql(dialect=dialect)
+                # Skip * wildcards
+                if col_name == "*":
+                    continue
+
+                # For unnamed columns, use positional naming like sqlglot does (_col_0, _col_1, etc.)
+                if not col_name:
+                    col_name = f"_col_{idx}"
+
+                # Get the expression for this column
+                if isinstance(select_col, exp.Alias):
+                    col_expr = select_col.this
+                else:
+                    col_expr = select_col
+
+                # Store the calculation
+                column_mappings[col_name] = col_expr.sql(dialect=dialect)
 
         ctes[cte_name] = CTEDefinition(
             name=cte_name,
@@ -107,15 +115,23 @@ def extract_ctes_from_optimized_sql(
 
             if subquery_alias and isinstance(subquery_expr, exp.Select):
                 column_mappings = {}
-                for select_col in subquery_expr.expressions:
+                for idx, select_col in enumerate(subquery_expr.expressions):
                     col_name = select_col.alias_or_name
-                    if col_name and col_name != "*":
-                        if isinstance(select_col, exp.Alias):
-                            col_expr = select_col.this
-                        else:
-                            col_expr = select_col
 
-                        column_mappings[col_name] = col_expr.sql(dialect=dialect)
+                    # Skip * wildcards
+                    if col_name == "*":
+                        continue
+
+                    # For unnamed columns, use positional naming like sqlglot does (_col_0, _col_1, etc.)
+                    if not col_name:
+                        col_name = f"_col_{idx}"
+
+                    if isinstance(select_col, exp.Alias):
+                        col_expr = select_col.this
+                    else:
+                        col_expr = select_col
+
+                    column_mappings[col_name] = col_expr.sql(dialect=dialect)
 
                 # Store as a "virtual CTE"
                 ctes[subquery_alias] = CTEDefinition(
