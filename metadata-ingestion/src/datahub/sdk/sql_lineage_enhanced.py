@@ -48,10 +48,26 @@ _empty_audit_stamp = models.AuditStampClass(
 class CTEDefinition:
     """Represents a CTE (Common Table Expression) definition."""
 
-    def __init__(self, name: str, select_expression: str, column_mappings: Dict[str, str]):
+    def __init__(
+        self, name: str, select_expression: str, column_mappings: Dict[str, str]
+    ):
         self.name = name
         self.select_expression = select_expression
         self.column_mappings = column_mappings  # output_col -> calculation
+
+
+def assign_anonymous_projection_aliases(
+    expression: sqlglot.exp.Expression,
+) -> sqlglot.exp.Expression:
+    """
+    Assign default aliases to anonymous projections in SELECT statements.
+    Mimics DataHub's behavior to ensure consistent referencing.
+    """
+    for select in expression.find_all(exp.Select):
+        for i, projection in enumerate(select.expressions):
+            if not projection.alias:
+                projection.set("alias", exp.to_identifier(f"_col_{i}"))
+    return expression
 
 
 def extract_ctes_from_optimized_sql(
@@ -68,6 +84,7 @@ def extract_ctes_from_optimized_sql(
 
     # Find all CTEs in the optimized statement
     for cte in statement.find_all(exp.CTE):
+        print(f"HERE IS SOME CTE DATA: {cte}")
         cte_name = cte.alias
         if not cte_name:
             continue
@@ -81,25 +98,16 @@ def extract_ctes_from_optimized_sql(
         column_mappings = {}
 
         if isinstance(cte_query, exp.Select):
-            for idx, select_col in enumerate(cte_query.expressions):
+            for select_col in cte_query.expressions:
                 col_name = select_col.alias_or_name
+                if col_name and col_name != "*":
+                    # Get the expression for this column
+                    if isinstance(select_col, exp.Alias):
+                        col_expr = select_col.this
+                    else:
+                        col_expr = select_col
 
-                # Skip * wildcards
-                if col_name == "*":
-                    continue
-
-                # For unnamed columns, use positional naming like sqlglot does (_col_0, _col_1, etc.)
-                if not col_name:
-                    col_name = f"_col_{idx}"
-
-                # Get the expression for this column
-                if isinstance(select_col, exp.Alias):
-                    col_expr = select_col.this
-                else:
-                    col_expr = select_col
-
-                # Store the calculation
-                column_mappings[col_name] = col_expr.sql(dialect=dialect)
+                    column_mappings[col_name] = col_expr.sql(dialect=dialect)
 
         ctes[cte_name] = CTEDefinition(
             name=cte_name,
@@ -108,30 +116,23 @@ def extract_ctes_from_optimized_sql(
         )
 
     # Also look for derived tables in JOINs (these are like inline CTEs)
-    for join in statement.find_all(exp.Join):
+    for join in statement.find_all(exp.Join, bfs=False):
+        print(f"HERE IS SOME join DATA: {join}")
         if isinstance(join.this, exp.Subquery):
             subquery_alias = join.this.alias
             subquery_expr = join.this.this
 
             if subquery_alias and isinstance(subquery_expr, exp.Select):
                 column_mappings = {}
-                for idx, select_col in enumerate(subquery_expr.expressions):
+                for select_col in subquery_expr.expressions:
                     col_name = select_col.alias_or_name
+                    if col_name and col_name != "*":
+                        if isinstance(select_col, exp.Alias):
+                            col_expr = select_col.this
+                        else:
+                            col_expr = select_col
 
-                    # Skip * wildcards
-                    if col_name == "*":
-                        continue
-
-                    # For unnamed columns, use positional naming like sqlglot does (_col_0, _col_1, etc.)
-                    if not col_name:
-                        col_name = f"_col_{idx}"
-
-                    if isinstance(select_col, exp.Alias):
-                        col_expr = select_col.this
-                    else:
-                        col_expr = select_col
-
-                    column_mappings[col_name] = col_expr.sql(dialect=dialect)
+                        column_mappings[col_name] = col_expr.sql(dialect=dialect)
 
                 # Store as a "virtual CTE"
                 ctes[subquery_alias] = CTEDefinition(
@@ -141,6 +142,16 @@ def extract_ctes_from_optimized_sql(
                 )
 
     return ctes
+
+
+def check_if_provided_name_is_columns_of_another_cte(
+    col_name: str, cte_definitions: Dict[str, CTEDefinition]
+):
+    for cte_def in cte_definitions.values():
+        if col_name in cte_def.column_mappings:
+            return True
+
+    return False
 
 
 def expand_cte_references_recursively(
@@ -176,14 +187,18 @@ def expand_cte_references_recursively(
         # Check if this references a CTE (including internal ones like _u_0, _u_1)
         if table_alias and table_alias in cte_definitions:
             cte_def = cte_definitions[table_alias]
-            logger.debug(f"      → CTE '{table_alias}' found, has columns: {list(cte_def.column_mappings.keys())}")
+            logger.debug(
+                f"      → CTE '{table_alias}' found, has columns: {list(cte_def.column_mappings.keys())}"
+            )
 
             if col_name in cte_def.column_mappings:
                 calculation = cte_def.column_mappings[col_name]
                 logger.debug(f"      → Expanding '{col_name}' to: {calculation}")
 
                 try:
-                    calc_expr = sqlglot.parse_one(f"SELECT {calculation}", dialect=dialect)
+                    calc_expr = sqlglot.parse_one(
+                        f"SELECT {calculation}", dialect=dialect
+                    )
                     if isinstance(calc_expr, exp.Select) and calc_expr.expressions:
                         replacement_expr = calc_expr.expressions[0]
 
@@ -198,7 +213,33 @@ def expand_cte_references_recursively(
                 except Exception as e:
                     logger.debug(f"      ❌ Failed to expand: {e}")
             else:
-                logger.debug(f"      ⚠️ Column '{col_name}' not found in CTE '{table_alias}'")
+                logger.debug(
+                    f"      ⚠️ Column '{col_name}' not found in CTE '{table_alias}'"
+                )
+        elif check_if_provided_name_is_columns_of_another_cte(
+            table_alias, cte_definitions
+        ):
+            for cte_def in cte_definitions.values():
+                if table_alias in cte_def.column_mappings:
+                    calculation = cte_def.column_mappings[table_alias]
+                    logger.debug(f"      → Expanding '{table_alias}' to: {calculation}")
+                    try:
+                        calc_expr = sqlglot.parse_one(
+                            f"SELECT {calculation}", dialect=dialect
+                        )
+                        if isinstance(calc_expr, exp.Select) and calc_expr.expressions:
+                            replacement_expr = calc_expr.expressions[0]
+
+                            # Remove alias if present
+                            if isinstance(replacement_expr, exp.Alias):
+                                replacement_expr = replacement_expr.this
+
+                            # Replace the column reference
+                            col_ref.replace(replacement_expr.copy())
+                            changed = True
+                            logger.debug(f"      ✅ Replaced successfully")
+                    except Exception as e:
+                        logger.debug(f"      ❌ Failed to expand: {e}")
         else:
             if table_alias:
                 logger.debug(f"      ⚠️ Table '{table_alias}' is not a CTE")
@@ -251,7 +292,9 @@ def replace_table_aliases_with_names(
                 dataset_urn = DatasetUrn.from_string(urn_str)
                 # Extract just the table name
                 table_name_parts = dataset_urn.name.split(".")
-                table_name = table_name_parts[-1] if table_name_parts else dataset_urn.name
+                table_name = (
+                    table_name_parts[-1] if table_name_parts else dataset_urn.name
+                )
                 col_ref.set("table", table_name)
             except Exception:
                 pass
@@ -266,6 +309,106 @@ def replace_table_aliases_with_names(
         result_sql = expr.sql(dialect=dialect)
 
     return result_sql
+
+
+def process_statement_as_datahub(
+    sql,
+    platform: str,
+    env: str,
+    graph: DataHubGraph | None = None,
+    platform_instance: str | None = None,
+    schema_aware: bool = True,
+    default_db: str | None = None,
+    default_schema: str | None = None,
+):
+    from datahub.sql_parsing.sqlglot_lineage import (
+        _normalize_db_or_schema,
+        parse_statement,
+        _simplify_select_into,
+        _table_level_lineage,
+        _TableName,
+        SchemaInfo,
+        create_schema_resolver,
+        _prepare_query_columns,
+        _try_extract_select,
+        get_dialect,
+        SQL_PARSER_TRACE,
+        cooperative_timeout,
+        SQL_LINEAGE_TIMEOUT_SECONDS,
+        SQL_LINEAGE_TIMEOUT_ENABLED,
+        sqlglot,
+    )
+
+    schema_resolver = create_schema_resolver(
+        platform=platform,
+        platform_instance=platform_instance,
+        env=env,
+        schema_aware=schema_aware,
+        graph=graph,
+    )
+    dialect = get_dialect(schema_resolver.platform)
+
+    default_db = _normalize_db_or_schema(default_db, dialect)
+    default_schema = _normalize_db_or_schema(default_schema, dialect)
+
+    logger.debug("Parsing lineage from sql statement: %s", sql)
+    statement = parse_statement(sql, dialect=dialect)
+
+    original_statement, statement = statement, statement.copy()
+    statement = _simplify_select_into(statement)
+
+    statement = sqlglot.optimizer.qualify.qualify(
+        statement,
+        dialect=dialect,
+        catalog=default_db,
+        db=default_schema,
+        qualify_columns=False,
+        validate_qualify_columns=False,
+        allow_partial_qualification=True,
+        identify=False,
+    )
+    tables, modified = _table_level_lineage(statement, dialect=dialect)
+    table_name_urn_mapping: Dict[_TableName, str] = {}
+    table_name_schema_mapping: Dict[_TableName, SchemaInfo] = {}
+
+    for table in tables | modified:
+        qualified_table = table.qualified(
+            dialect=dialect, default_db=default_db, default_schema=default_schema
+        )
+        urn, schema_info = schema_resolver.resolve_table(qualified_table)
+        table_name_urn_mapping[qualified_table] = urn
+        if schema_info:
+            table_name_schema_mapping[qualified_table] = schema_info
+        table_name_urn_mapping[table] = urn
+
+    total_tables_discovered = len(tables | modified)
+    total_schemas_resolved = len(table_name_schema_mapping)
+    logger.debug(
+        f"Resolved {total_schemas_resolved} of {total_tables_discovered} table schemas"
+    )
+    if SQL_PARSER_TRACE:
+        for qualified_table, schema_info in table_name_schema_mapping.items():
+            logger.debug(
+                "Table name %s resolved to %s with schema %s",
+                qualified_table,
+                table_name_urn_mapping[qualified_table],
+                schema_info,
+            )
+
+    with cooperative_timeout(
+        timeout=(SQL_LINEAGE_TIMEOUT_SECONDS if SQL_LINEAGE_TIMEOUT_ENABLED else None)
+    ):
+        select_statement = _try_extract_select(statement)
+
+        (select_statement, column_resolver) = _prepare_query_columns(
+            select_statement,
+            dialect=dialect,
+            table_schemas=table_name_schema_mapping,
+            default_db=default_db,
+            default_schema=default_schema,
+        )
+
+    return select_statement
 
 
 def infer_lineage_from_sql_with_enhanced_transformation_logic(
@@ -349,57 +492,39 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
         # Get the optimized statement to extract CTEs from
         dialect = get_dialect(override_dialect or platform)
 
-        # Parse and optimize the SQL to get internal CTEs
+        # Parse the SQL
         statement = sqlglot.parse_one(query_text, dialect=dialect)
 
-        # Apply the same optimizations that DataHub's parser uses
-        # Use the same optimization rules as DataHub (qualify + unnest_subqueries)
-        _OPTIMIZE_RULES = (
-            sqlglot.optimizer.optimizer.qualify,
-            sqlglot.optimizer.optimizer.unnest_subqueries,
+        optimized_statement = process_statement_as_datahub(
+            query_text,
+            platform,
+            env,
+            actual_graph,
+            platform_instance,
+            True,
+            default_db,
+            default_schema,
         )
-
-        try:
-            optimized_statement = sqlglot.optimizer.optimizer.optimize(
-                statement.copy(),
-                dialect=dialect,
-                schema=None,  # We don't have schema info, but that's OK for structure
-                qualify_columns=False,  # Don't qualify columns without schema
-                validate_qualify_columns=False,
-                allow_partial_qualification=True,
-                identify=False,
-                catalog=default_db,
-                db=default_schema,
-                rules=_OPTIMIZE_RULES,
-            )
-            logger.debug("✅ Successfully optimized SQL with unnest_subqueries")
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f"Optimized SQL:\n{optimized_statement.sql(pretty=True, dialect=dialect)}")
-        except Exception as e:
-            logger.debug(f"⚠️ Optimization failed, using basic qualify: {e}")
-            # Fallback to basic qualify if optimize fails
-            optimized_statement = sqlglot.optimizer.qualify.qualify(
-                statement.copy(),
-                dialect=dialect,
-                catalog=default_db,
-                db=default_schema,
-                qualify_columns=False,
-                validate_qualify_columns=False,
-                allow_partial_qualification=True,
-                identify=False,
-            )
-
-        # Extract CTE definitions from the optimized statement
         cte_definitions = {}
         if expand_ctes:
-            cte_definitions = extract_ctes_from_optimized_sql(optimized_statement, dialect)
-            logger.info(f"🔍 Extracted {len(cte_definitions)} CTE definitions: {list(cte_definitions.keys())}")
+            cte_definitions = extract_ctes_from_optimized_sql(
+                optimized_statement, dialect
+            )
+            logger.info(
+                f"🔍 Extracted {len(cte_definitions)} CTE definitions: {list(cte_definitions.keys())}"
+            )
 
             # Debug: Show CTE contents
             for cte_name, cte_def in cte_definitions.items():
-                logger.info(f"  CTE '{cte_name}' columns: {list(cte_def.column_mappings.keys())}")
+                logger.info(
+                    f"  CTE '{cte_name}' columns: {list(cte_def.column_mappings.keys())}"
+                )
                 for col_name, col_expr in cte_def.column_mappings.items():
-                    logger.info(f"    {col_name} = {col_expr[:100]}..." if len(col_expr) > 100 else f"    {col_name} = {col_expr}")
+                    logger.info(
+                        f"    {col_name} = {col_expr[:100]}..."
+                        if len(col_expr) > 100
+                        else f"    {col_name} = {col_expr}"
+                    )
 
         # Build table alias to URN mapping
         table_alias_to_urn: Dict[str, str] = {}
@@ -483,7 +608,9 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
                         raw_logic = col_lineage.logic.column_logic
                         enhanced_logic = raw_logic
 
-                        logger.info(f"\n📊 Processing column: {col_lineage.downstream.column}")
+                        logger.info(
+                            f"\n📊 Processing column: {col_lineage.downstream.column}"
+                        )
                         logger.info(f"  Raw logic: {raw_logic}")
 
                         # Step 1: Expand CTE references
@@ -496,7 +623,9 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
                                     max_depth=5,
                                 )
                                 if enhanced_logic != raw_logic:
-                                    logger.info(f"  After CTE expansion: {enhanced_logic}")
+                                    logger.info(
+                                        f"  After CTE expansion: {enhanced_logic}"
+                                    )
                                 else:
                                     logger.info(f"  ⚠️ CTE expansion: no changes made")
                             except Exception as e:
@@ -512,7 +641,9 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
                                     dialect,
                                 )
                                 if enhanced_logic != before_alias_replacement:
-                                    logger.info(f"  After alias replacement: {enhanced_logic}")
+                                    logger.info(
+                                        f"  After alias replacement: {enhanced_logic}"
+                                    )
                             except Exception as e:
                                 logger.warning(f"  ❌ Failed to replace aliases: {e}")
 
