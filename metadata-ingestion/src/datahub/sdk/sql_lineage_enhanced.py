@@ -850,41 +850,51 @@ def parse_procedure_to_nodes(
     Handles PostgreSQL and Oracle procedure syntax.
     """
     nodes: List[ProcedureNode] = []
+    sequence = 0
 
     try:
         parsed = sqlglot.parse(procedure_sql, dialect=dialect)
-        if not parsed:
+        if not parsed or len(parsed) == 0:
             logger.warning("Failed to parse procedure, treating as single statement")
             parsed = [sqlglot.parse_one(procedure_sql, dialect=dialect)]
     except Exception as e:
         logger.warning(f"Failed to parse procedure: {e}, treating as single statement")
-        parsed = [sqlglot.parse_one(procedure_sql, dialect=dialect)]
-
-    sequence = 0
+        try:
+            parsed = [sqlglot.parse_one(procedure_sql, dialect=dialect)]
+        except Exception as e2:
+            logger.error(f"Cannot parse procedure at all: {e2}")
+            nodes.append(
+                ProcedureNode(
+                    node_id="node_0",
+                    node_type=NodeType.UNKNOWN,
+                    sql_text=procedure_sql,
+                    sequence_order=0,
+                )
+            )
+            return nodes
 
     for statement in parsed:
         if statement is None:
             continue
 
-        if isinstance(statement, (exp.Create, exp.Command)):
-            create_node = statement
-            if isinstance(create_node, exp.Create) and create_node.kind == "FUNCTION":
-                if create_node.expression:
-                    inner_statements = _extract_statements_from_function_body(
-                        create_node.expression, dialect
-                    )
-
-                    param_names = _extract_function_parameters(create_node)
-                    if param_names:
-                        nodes.append(
-                            ProcedureNode(
-                                node_id=f"node_0_start",
-                                node_type=NodeType.PROCEDURE_START,
-                                sql_text=f"-- Parameters: {', '.join(param_names)}",
-                                sequence_order=sequence,
-                            )
+        if isinstance(statement, exp.Create):
+            if statement.kind == "FUNCTION" or statement.kind == "PROCEDURE":
+                param_names = _extract_function_parameters(statement)
+                if param_names:
+                    nodes.append(
+                        ProcedureNode(
+                            node_id=f"node_{sequence}_start",
+                            node_type=NodeType.PROCEDURE_START,
+                            sql_text=f"-- Parameters: {', '.join(param_names)}",
+                            sequence_order=sequence,
                         )
-                        sequence += 1
+                    )
+                    sequence += 1
+
+                if statement.expression:
+                    inner_statements = _extract_statements_from_function_body(
+                        statement.expression, dialect
+                    )
 
                     for stmt in inner_statements:
                         node_type = _classify_statement_type(stmt)
@@ -898,15 +908,9 @@ def parse_procedure_to_nodes(
                         )
                         sequence += 1
                 else:
-                    nodes.append(
-                        ProcedureNode(
-                            node_id=f"node_{sequence}",
-                            node_type=NodeType.UNKNOWN,
-                            sql_text=statement.sql(dialect=dialect),
-                            sequence_order=sequence,
-                        )
+                    logger.warning(
+                        f"CREATE {statement.kind} has no body, skipping extraction"
                     )
-                    sequence += 1
             else:
                 node_type = _classify_statement_type(statement)
                 nodes.append(
@@ -918,6 +922,20 @@ def parse_procedure_to_nodes(
                     )
                 )
                 sequence += 1
+
+        elif isinstance(statement, exp.Command):
+            sql_text = statement.sql(dialect=dialect)
+            node_type = _classify_statement_type(statement)
+            nodes.append(
+                ProcedureNode(
+                    node_id=f"node_{sequence}",
+                    node_type=node_type,
+                    sql_text=sql_text,
+                    sequence_order=sequence,
+                )
+            )
+            sequence += 1
+
         else:
             node_type = _classify_statement_type(statement)
             nodes.append(
@@ -964,17 +982,20 @@ def _extract_statements_from_function_body(
     """Extract individual statements from a function body."""
     statements = []
 
-    if isinstance(body, exp.Block):
-        for stmt in body.expressions:
-            if stmt:
-                statements.append(stmt)
-    elif isinstance(body, (exp.Select, exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+    if isinstance(body, (exp.Select, exp.Insert, exp.Update, exp.Delete, exp.Merge)):
         statements.append(body)
     else:
-        for stmt in body.find_all(
-            (exp.Select, exp.Insert, exp.Update, exp.Delete, exp.Merge, exp.Create)
-        ):
-            statements.append(stmt)
+        statement_types = (
+            exp.Select,
+            exp.Insert,
+            exp.Update,
+            exp.Delete,
+            exp.Merge,
+            exp.Create,
+        )
+        for stmt in body.find_all(statement_types):
+            if stmt not in statements:
+                statements.append(stmt)
 
     return statements
 
