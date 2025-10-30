@@ -12,6 +12,9 @@ This module provides advanced transformation logic extraction that:
 from __future__ import annotations
 
 import logging
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import sqlglot
@@ -24,6 +27,8 @@ from datahub.errors import SdkUsageError
 from datahub.ingestion.graph.client import DataHubGraph
 from datahub.metadata.urns import DatasetUrn, QueryUrn, SchemaFieldUrn
 from datahub.sdk._utils import DEFAULT_ACTOR_URN
+from datahub.sdk.dataflow import DataFlow
+from datahub.sdk.datajob import DataJob
 from datahub.sdk.main_client import DataHubClient
 from datahub.specific.dataset import DatasetPatchBuilder
 from datahub.sql_parsing.fingerprint_utils import generate_hash
@@ -54,6 +59,99 @@ class CTEDefinition:
         self.name = name
         self.select_expression = select_expression
         self.column_mappings = column_mappings  # output_col -> calculation
+
+
+class NodeType(Enum):
+    """Types of nodes in a procedure execution flow."""
+
+    PROCEDURE_START = "procedure_start"
+    CREATE_TEMP_TABLE = "create_temp_table"
+    INSERT = "insert"
+    UPDATE = "update"
+    DELETE = "delete"
+    MERGE = "merge"
+    TRUNCATE = "truncate"
+    SELECT_INTO = "select_into"
+    UNKNOWN = "unknown"
+
+
+@dataclass
+class TempTableInfo:
+    """Information about a temporary table created during procedure execution."""
+
+    table_name: str
+    columns: Dict[str, str] = field(default_factory=dict)  # column_name -> source_expr
+    created_in_node_id: str = ""
+    dataset_urn: Optional[str] = None
+    column_lineage: Optional[SqlParsingResult] = None
+
+
+@dataclass
+class ProcedureNode:
+    """Represents a single operation node in a SQL procedure."""
+
+    node_id: str
+    node_type: NodeType
+    sql_text: str
+    sequence_order: int
+    lineage_result: Optional[SqlParsingResult] = None
+    created_temp_tables: List[str] = field(default_factory=list)
+    used_temp_tables: List[str] = field(default_factory=list)
+    upstream_nodes: List[str] = field(default_factory=list)
+    downstream_nodes: List[str] = field(default_factory=list)
+
+
+class TempTableTracker:
+    """Tracks temporary tables throughout procedure execution."""
+
+    def __init__(self):
+        self.temp_tables: Dict[str, TempTableInfo] = {}
+        self._table_name_variations: Dict[str, str] = {}
+
+    def register_temp_table(
+        self,
+        table_name: str,
+        columns: Dict[str, str],
+        created_in_node_id: str,
+        dataset_urn: Optional[str] = None,
+    ) -> None:
+        """Register a new temporary table."""
+        normalized_name = table_name.lower()
+        self.temp_tables[normalized_name] = TempTableInfo(
+            table_name=table_name,
+            columns=columns,
+            created_in_node_id=created_in_node_id,
+            dataset_urn=dataset_urn,
+        )
+        self._table_name_variations[normalized_name] = table_name
+        logger.info(
+            f"📝 Registered temp table '{table_name}' with {len(columns)} columns"
+        )
+
+    def is_temp_table(self, table_name: str) -> bool:
+        """Check if a table is a registered temporary table."""
+        return table_name.lower() in self.temp_tables
+
+    def get_temp_table(self, table_name: str) -> Optional[TempTableInfo]:
+        """Get information about a temporary table."""
+        return self.temp_tables.get(table_name.lower())
+
+    def resolve_column_source(
+        self, table_name: str, column_name: str
+    ) -> Optional[str]:
+        """Resolve the source expression for a temp table column."""
+        temp_table = self.get_temp_table(table_name)
+        if temp_table and column_name in temp_table.columns:
+            return temp_table.columns[column_name]
+        return None
+
+    def set_column_lineage(
+        self, table_name: str, lineage_result: SqlParsingResult
+    ) -> None:
+        """Store the column lineage result for a temp table."""
+        temp_table = self.get_temp_table(table_name)
+        if temp_table:
+            temp_table.column_lineage = lineage_result
 
 
 def assign_anonymous_projection_aliases(
@@ -713,5 +811,425 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
 
     finally:
         # Restore original logging level
+        if suppress_warnings:
+            sqlglot_logger.setLevel(original_sqlglot_level)
+
+
+def _classify_statement_type(statement: sqlglot.exp.Expression) -> NodeType:
+    """Classify a SQL statement into a node type."""
+    if isinstance(statement, exp.Create):
+        if statement.args.get("temporary"):
+            return NodeType.CREATE_TEMP_TABLE
+        return NodeType.UNKNOWN
+    elif isinstance(statement, exp.Insert):
+        return NodeType.INSERT
+    elif isinstance(statement, exp.Update):
+        return NodeType.UPDATE
+    elif isinstance(statement, exp.Delete):
+        return NodeType.DELETE
+    elif isinstance(statement, exp.Merge):
+        return NodeType.MERGE
+    elif isinstance(statement, exp.Command):
+        sql_lower = statement.sql().lower()
+        if "truncate" in sql_lower:
+            return NodeType.TRUNCATE
+        return NodeType.UNKNOWN
+    else:
+        return NodeType.UNKNOWN
+
+
+def parse_procedure_to_nodes(
+    procedure_sql: str,
+    dialect: str,
+    procedure_name: Optional[str] = None,
+) -> List[ProcedureNode]:
+    """
+    Parse a SQL procedure into individual execution nodes.
+
+    Extracts individual SQL statements from a procedure and classifies them.
+    Handles PostgreSQL and Oracle procedure syntax.
+    """
+    nodes: List[ProcedureNode] = []
+
+    try:
+        parsed = sqlglot.parse(procedure_sql, dialect=dialect)
+        if not parsed:
+            logger.warning("Failed to parse procedure, treating as single statement")
+            parsed = [sqlglot.parse_one(procedure_sql, dialect=dialect)]
+    except Exception as e:
+        logger.warning(f"Failed to parse procedure: {e}, treating as single statement")
+        parsed = [sqlglot.parse_one(procedure_sql, dialect=dialect)]
+
+    sequence = 0
+
+    for statement in parsed:
+        if statement is None:
+            continue
+
+        if isinstance(statement, (exp.Create, exp.Command)):
+            create_node = statement
+            if isinstance(create_node, exp.Create) and create_node.kind == "FUNCTION":
+                if create_node.expression:
+                    inner_statements = _extract_statements_from_function_body(
+                        create_node.expression, dialect
+                    )
+
+                    param_names = _extract_function_parameters(create_node)
+                    if param_names:
+                        nodes.append(
+                            ProcedureNode(
+                                node_id=f"node_0_start",
+                                node_type=NodeType.PROCEDURE_START,
+                                sql_text=f"-- Parameters: {', '.join(param_names)}",
+                                sequence_order=sequence,
+                            )
+                        )
+                        sequence += 1
+
+                    for stmt in inner_statements:
+                        node_type = _classify_statement_type(stmt)
+                        nodes.append(
+                            ProcedureNode(
+                                node_id=f"node_{sequence}",
+                                node_type=node_type,
+                                sql_text=stmt.sql(dialect=dialect),
+                                sequence_order=sequence,
+                            )
+                        )
+                        sequence += 1
+                else:
+                    nodes.append(
+                        ProcedureNode(
+                            node_id=f"node_{sequence}",
+                            node_type=NodeType.UNKNOWN,
+                            sql_text=statement.sql(dialect=dialect),
+                            sequence_order=sequence,
+                        )
+                    )
+                    sequence += 1
+            else:
+                node_type = _classify_statement_type(statement)
+                nodes.append(
+                    ProcedureNode(
+                        node_id=f"node_{sequence}",
+                        node_type=node_type,
+                        sql_text=statement.sql(dialect=dialect),
+                        sequence_order=sequence,
+                    )
+                )
+                sequence += 1
+        else:
+            node_type = _classify_statement_type(statement)
+            nodes.append(
+                ProcedureNode(
+                    node_id=f"node_{sequence}",
+                    node_type=node_type,
+                    sql_text=statement.sql(dialect=dialect),
+                    sequence_order=sequence,
+                )
+            )
+            sequence += 1
+
+    if not nodes:
+        logger.warning("No nodes extracted, creating single node from entire procedure")
+        nodes.append(
+            ProcedureNode(
+                node_id="node_0",
+                node_type=NodeType.UNKNOWN,
+                sql_text=procedure_sql,
+                sequence_order=0,
+            )
+        )
+
+    logger.info(f"📦 Extracted {len(nodes)} nodes from procedure")
+    for node in nodes:
+        logger.info(f"  - Node {node.sequence_order}: {node.node_type.value}")
+
+    return nodes
+
+
+def _extract_function_parameters(create_func: exp.Create) -> List[str]:
+    """Extract parameter names from a CREATE FUNCTION statement."""
+    params = []
+    if hasattr(create_func, "args") and "params" in create_func.args:
+        for param in create_func.args["params"].expressions:
+            if isinstance(param, exp.ColumnDef):
+                params.append(param.name)
+    return params
+
+
+def _extract_statements_from_function_body(
+    body: sqlglot.exp.Expression, dialect: str
+) -> List[sqlglot.exp.Expression]:
+    """Extract individual statements from a function body."""
+    statements = []
+
+    if isinstance(body, exp.Block):
+        for stmt in body.expressions:
+            if stmt:
+                statements.append(stmt)
+    elif isinstance(body, (exp.Select, exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+        statements.append(body)
+    else:
+        for stmt in body.find_all(
+            (exp.Select, exp.Insert, exp.Update, exp.Delete, exp.Merge, exp.Create)
+        ):
+            statements.append(stmt)
+
+    return statements
+
+
+def _process_temp_table_creation_node(
+    node: ProcedureNode,
+    temp_tracker: TempTableTracker,
+    platform: str,
+    env: str,
+    graph: DataHubGraph,
+    platform_instance: Optional[str],
+    default_db: Optional[str],
+    default_schema: Optional[str],
+    dialect: sqlglot.Dialect,
+) -> None:
+    """Process a CREATE TEMP TABLE node and register the temp table."""
+    from datahub.sql_parsing.sqlglot_lineage import create_lineage_sql_parsed_result
+
+    try:
+        statement = sqlglot.parse_one(node.sql_text, dialect=dialect)
+
+        if not isinstance(statement, exp.Create):
+            logger.warning(f"Node {node.node_id} is not a CREATE statement")
+            return
+
+        table_name = None
+        if statement.this:
+            if isinstance(statement.this, exp.Table):
+                table_name = statement.this.name
+            elif isinstance(statement.this, exp.Schema):
+                if statement.this.this and isinstance(statement.this.this, exp.Table):
+                    table_name = statement.this.this.name
+
+        if not table_name:
+            logger.warning(f"Could not extract table name from CREATE statement")
+            return
+
+        select_stmt = statement.expression
+        if not select_stmt or not isinstance(select_stmt, exp.Select):
+            logger.warning(f"CREATE TEMP TABLE without SELECT, skipping lineage")
+            temp_tracker.register_temp_table(
+                table_name=table_name,
+                columns={},
+                created_in_node_id=node.node_id,
+            )
+            node.created_temp_tables.append(table_name)
+            return
+
+        select_sql = select_stmt.sql(dialect=dialect)
+        parsed_result: SqlParsingResult = create_lineage_sql_parsed_result(
+            query=select_sql,
+            default_db=default_db,
+            default_schema=default_schema,
+            platform=platform,
+            platform_instance=platform_instance,
+            env=env,
+            graph=graph,
+        )
+
+        columns = {}
+        if parsed_result.column_lineage:
+            for col_lineage in parsed_result.column_lineage:
+                if col_lineage.downstream and col_lineage.downstream.column:
+                    col_name = col_lineage.downstream.column
+                    source_expr = (
+                        col_lineage.logic.column_logic
+                        if col_lineage.logic
+                        else col_name
+                    )
+                    columns[col_name] = source_expr
+
+        virtual_urn = f"urn:li:dataset:(urn:li:dataPlatform:{platform},temp.{table_name},{env})"
+
+        temp_tracker.register_temp_table(
+            table_name=table_name,
+            columns=columns,
+            created_in_node_id=node.node_id,
+            dataset_urn=virtual_urn,
+        )
+        temp_tracker.set_column_lineage(table_name, parsed_result)
+
+        node.created_temp_tables.append(table_name)
+        node.lineage_result = parsed_result
+
+        logger.info(
+            f"✅ Processed CREATE TEMP TABLE '{table_name}' with {len(columns)} columns"
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to process temp table creation: {e}", exc_info=True)
+
+
+def process_procedure_lineage(
+    *,
+    graph: Union[DataHubGraph, DataHubClient],
+    procedure_sql: str,
+    procedure_name: str,
+    platform: str,
+    platform_instance: Optional[str] = None,
+    env: str = "PROD",
+    default_db: Optional[str] = None,
+    default_schema: Optional[str] = None,
+    procedure_parameters: Optional[Dict[str, str]] = None,
+    override_dialect: Optional[str] = None,
+    expand_ctes: bool = True,
+    replace_aliases: bool = True,
+    suppress_warnings: bool = True,
+) -> None:
+    """
+    Process lineage for an entire SQL procedure with multiple operations.
+
+    Creates a DataFlow representing the procedure and DataJob nodes for each operation.
+    Tracks temporary tables across operations and resolves their lineage.
+
+    Args:
+        graph: DataHubGraph or DataHubClient instance
+        procedure_sql: Full SQL procedure code
+        procedure_name: Name of the procedure (for DataFlow)
+        platform: Data platform identifier
+        platform_instance: Optional platform instance
+        env: Environment (default: "PROD")
+        default_db: Default database name
+        default_schema: Default schema name
+        procedure_parameters: Optional dict of procedure parameters
+        override_dialect: Optional dialect override
+        expand_ctes: Whether to expand CTE references (default: True)
+        replace_aliases: Whether to replace table aliases (default: True)
+        suppress_warnings: Whether to suppress sqlglot warnings (default: True)
+    """
+    if suppress_warnings:
+        sqlglot_logger.setLevel(logging.ERROR)
+
+    try:
+        if isinstance(graph, DataHubClient):
+            actual_graph = graph._graph
+        else:
+            actual_graph = graph
+
+        dialect = get_dialect(override_dialect or platform)
+
+        logger.info(f"🚀 Processing procedure: {procedure_name}")
+
+        nodes = parse_procedure_to_nodes(procedure_sql, dialect, procedure_name)
+        temp_tracker = TempTableTracker()
+
+        flow = DataFlow(
+            platform="sql_procedure",
+            name=procedure_name,
+            platform_instance=platform_instance,
+            env=env,
+            description=f"SQL Procedure: {procedure_name}",
+            subtype="SQL_PROCEDURE",
+        )
+
+        logger.info(f"📊 Created DataFlow for procedure: {flow.urn}")
+
+        jobs = []
+        for node in nodes:
+            logger.info(
+                f"\n{'='*60}\n🔄 Processing node {node.sequence_order}: {node.node_type.value}\n{'='*60}"
+            )
+
+            if node.node_type == NodeType.PROCEDURE_START:
+                job = DataJob(
+                    name=f"{procedure_name}_start",
+                    flow=flow,
+                    description=f"Procedure start - {node.sql_text}",
+                )
+                jobs.append(job)
+                continue
+
+            if node.node_type == NodeType.CREATE_TEMP_TABLE:
+                _process_temp_table_creation_node(
+                    node,
+                    temp_tracker,
+                    platform,
+                    env,
+                    actual_graph,
+                    platform_instance,
+                    default_db,
+                    default_schema,
+                    dialect,
+                )
+
+                job = DataJob(
+                    name=f"{procedure_name}_node_{node.sequence_order}",
+                    flow=flow,
+                    description=f"Create temp table - {node.created_temp_tables}",
+                )
+
+                if node.lineage_result:
+                    for upstream_table in node.lineage_result.in_tables:
+                        job.set_inlets([upstream_table])
+
+                    if node.created_temp_tables:
+                        temp_info = temp_tracker.get_temp_table(
+                            node.created_temp_tables[0]
+                        )
+                        if temp_info and temp_info.dataset_urn:
+                            job.set_outlets([temp_info.dataset_urn])
+
+                jobs.append(job)
+
+            elif node.node_type in (
+                NodeType.INSERT,
+                NodeType.UPDATE,
+                NodeType.DELETE,
+                NodeType.MERGE,
+            ):
+                try:
+                    infer_lineage_from_sql_with_enhanced_transformation_logic(
+                        graph=actual_graph,
+                        query_text=node.sql_text,
+                        platform=platform,
+                        platform_instance=platform_instance,
+                        env=env,
+                        default_db=default_db,
+                        default_schema=default_schema,
+                        override_dialect=override_dialect,
+                        expand_ctes=expand_ctes,
+                        replace_aliases=replace_aliases,
+                        suppress_warnings=suppress_warnings,
+                    )
+
+                    job = DataJob(
+                        name=f"{procedure_name}_node_{node.sequence_order}",
+                        flow=flow,
+                        description=f"{node.node_type.value.upper()} operation",
+                    )
+                    jobs.append(job)
+
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to process lineage for node {node.sequence_order}: {e}"
+                    )
+
+            elif node.node_type == NodeType.TRUNCATE:
+                job = DataJob(
+                    name=f"{procedure_name}_node_{node.sequence_order}",
+                    flow=flow,
+                    description=f"TRUNCATE operation",
+                )
+                jobs.append(job)
+
+        logger.info(f"\n{'='*60}")
+        logger.info(f"✅ Successfully processed procedure '{procedure_name}'")
+        logger.info(f"   - Created DataFlow: {flow.urn}")
+        logger.info(f"   - Created {len(jobs)} DataJob nodes")
+        logger.info(f"   - Tracked {len(temp_tracker.temp_tables)} temp tables")
+        logger.info(f"{'='*60}\n")
+
+        actual_graph.emit(flow)
+        for job in jobs:
+            actual_graph.emit(job)
+
+    finally:
         if suppress_warnings:
             sqlglot_logger.setLevel(original_sqlglot_level)
