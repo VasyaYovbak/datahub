@@ -12,6 +12,7 @@ This module provides advanced transformation logic extraction that:
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -815,6 +816,109 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
             sqlglot_logger.setLevel(original_sqlglot_level)
 
 
+def _extract_statements_from_text(procedure_sql: str, dialect: str) -> List[str]:
+    """
+    Extract SQL statements from procedure text using regex.
+
+    This is a fallback when sqlglot cannot parse the procedure structure.
+    Extracts common DML/DDL statements from the procedure body.
+    """
+    statements = []
+
+    procedure_body = procedure_sql
+    begin_match = re.search(r'\bBEGIN\b', procedure_sql, re.IGNORECASE)
+    end_match = re.search(r'\bEND\s*;?\s*\$\$', procedure_sql, re.IGNORECASE)
+
+    if begin_match and end_match:
+        procedure_body = procedure_sql[begin_match.end():end_match.start()]
+        logger.debug(f"Extracted procedure body between BEGIN and END")
+
+    patterns = [
+        (r'TRUNCATE\s+TABLE\s+[\w.]+\s*;', NodeType.TRUNCATE),
+        (
+            r'CREATE\s+(?:TEMP|TEMPORARY)\s+TABLE\s+[\w.]+\s+AS\s+SELECT\s+.+?(?=(?:CREATE|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|GET\s+DIAGNOSTICS|RETURN|\Z))',
+            NodeType.CREATE_TEMP_TABLE,
+        ),
+        (
+            r'INSERT\s+INTO\s+[\w.]+\s*\([^)]*\)\s+SELECT\s+.+?(?=(?:CREATE|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|GET\s+DIAGNOSTICS|RETURN|\Z))',
+            NodeType.INSERT,
+        ),
+        (r'UPDATE\s+[\w.]+\s+SET\s+.+?;', NodeType.UPDATE),
+        (r'DELETE\s+FROM\s+[\w.]+\s+.+?;', NodeType.DELETE),
+        (r'MERGE\s+INTO\s+[\w.]+\s+.+?;', NodeType.MERGE),
+    ]
+
+    for pattern, node_type in patterns:
+        matches = re.finditer(pattern, procedure_body, re.IGNORECASE | re.DOTALL)
+        for match in matches:
+            sql_text = match.group(0).strip()
+            sql_text = re.sub(r'\s+', ' ', sql_text)
+            if not sql_text.endswith(';'):
+                sql_text += ';'
+
+            if sql_text not in statements:
+                statements.append(sql_text)
+                logger.debug(f"  Extracted: {sql_text[:80]}...")
+
+    logger.info(f"📝 Regex extracted {len(statements)} statements from procedure body")
+    return statements
+
+
+def _parse_statements_with_regex_fallback(
+    procedure_sql: str, dialect: str
+) -> List[ProcedureNode]:
+    """Parse procedure using regex fallback when sqlglot fails."""
+    nodes: List[ProcedureNode] = []
+
+    param_match = re.search(
+        r'FUNCTION\s+\w+\s*\((.*?)\)', procedure_sql, re.IGNORECASE | re.DOTALL
+    )
+    if param_match:
+        params_text = param_match.group(1).strip()
+        if params_text:
+            nodes.append(
+                ProcedureNode(
+                    node_id=f"node_0_start",
+                    node_type=NodeType.PROCEDURE_START,
+                    sql_text=f"-- Parameters: {params_text}",
+                    sequence_order=0,
+                )
+            )
+
+    statements = _extract_statements_from_text(procedure_sql, dialect)
+
+    for i, sql_text in enumerate(statements, start=len(nodes)):
+        try:
+            parsed_stmt = sqlglot.parse_one(sql_text, dialect=dialect)
+            node_type = _classify_statement_type(parsed_stmt)
+        except Exception:
+            if "TRUNCATE" in sql_text.upper():
+                node_type = NodeType.TRUNCATE
+            elif "CREATE" in sql_text.upper() and "TEMP" in sql_text.upper():
+                node_type = NodeType.CREATE_TEMP_TABLE
+            elif "INSERT" in sql_text.upper():
+                node_type = NodeType.INSERT
+            elif "UPDATE" in sql_text.upper():
+                node_type = NodeType.UPDATE
+            elif "DELETE" in sql_text.upper():
+                node_type = NodeType.DELETE
+            elif "MERGE" in sql_text.upper():
+                node_type = NodeType.MERGE
+            else:
+                node_type = NodeType.UNKNOWN
+
+        nodes.append(
+            ProcedureNode(
+                node_id=f"node_{i}",
+                node_type=node_type,
+                sql_text=sql_text,
+                sequence_order=i,
+            )
+        )
+
+    return nodes
+
+
 def _classify_statement_type(statement: sqlglot.exp.Expression) -> NodeType:
     """Classify a SQL statement into a node type."""
     if isinstance(statement, exp.Create):
@@ -949,7 +1053,13 @@ def parse_procedure_to_nodes(
             sequence += 1
 
     if not nodes:
-        logger.warning("No nodes extracted, creating single node from entire procedure")
+        logger.warning(
+            "No nodes extracted via sqlglot, trying regex fallback method..."
+        )
+        nodes = _parse_statements_with_regex_fallback(procedure_sql, dialect)
+
+    if not nodes:
+        logger.warning("Regex fallback also failed, creating single node")
         nodes.append(
             ProcedureNode(
                 node_id="node_0",
@@ -1247,9 +1357,12 @@ def process_procedure_lineage(
         logger.info(f"   - Tracked {len(temp_tracker.temp_tables)} temp tables")
         logger.info(f"{'='*60}\n")
 
-        actual_graph.emit(flow)
+        for mcp in flow.generate_mcps():
+            actual_graph.emit_mcp(mcp)
+
         for job in jobs:
-            actual_graph.emit(job)
+            for mcp in job.generate_mcps():
+                actual_graph.emit_mcp(mcp)
 
     finally:
         if suppress_warnings:
