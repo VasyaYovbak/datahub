@@ -852,11 +852,16 @@ def _extract_statements_from_text(procedure_sql: str, dialect: str) -> List[str]
         matches = re.finditer(pattern, procedure_body, re.IGNORECASE | re.DOTALL)
         for match in matches:
             sql_text = match.group(0).strip()
+
+            sql_text = re.sub(r'--[^\n]*', '', sql_text)
+            sql_text = re.sub(r'/\*.*?\*/', ' ', sql_text, flags=re.DOTALL)
+
             sql_text = re.sub(r'\s+', ' ', sql_text)
+
             if not sql_text.endswith(';'):
                 sql_text += ';'
 
-            if sql_text not in statements:
+            if sql_text and sql_text not in statements:
                 statements.append(sql_text)
                 logger.debug(f"  Extracted: {sql_text[:80]}...")
 
@@ -885,26 +890,28 @@ def _parse_statements_with_regex_fallback(
                 )
             )
 
-    statements = _extract_statements_from_text(procedure_sql, dialect)
+    statements_with_types = _extract_statements_from_text(procedure_sql, dialect)
 
-    for i, sql_text in enumerate(statements, start=len(nodes)):
-        try:
-            parsed_stmt = sqlglot.parse_one(sql_text, dialect=dialect)
-            node_type = _classify_statement_type(parsed_stmt)
-        except Exception:
-            if "TRUNCATE" in sql_text.upper():
-                node_type = NodeType.TRUNCATE
-            elif "CREATE" in sql_text.upper() and "TEMP" in sql_text.upper():
-                node_type = NodeType.CREATE_TEMP_TABLE
-            elif "INSERT" in sql_text.upper():
-                node_type = NodeType.INSERT
-            elif "UPDATE" in sql_text.upper():
-                node_type = NodeType.UPDATE
-            elif "DELETE" in sql_text.upper():
-                node_type = NodeType.DELETE
-            elif "MERGE" in sql_text.upper():
-                node_type = NodeType.MERGE
-            else:
+    for i, sql_text in enumerate(statements_with_types, start=len(nodes)):
+        sql_upper = sql_text.upper()
+
+        if "TRUNCATE" in sql_upper:
+            node_type = NodeType.TRUNCATE
+        elif "CREATE" in sql_upper and ("TEMP" in sql_upper or "TEMPORARY" in sql_upper):
+            node_type = NodeType.CREATE_TEMP_TABLE
+        elif "INSERT" in sql_upper:
+            node_type = NodeType.INSERT
+        elif "UPDATE" in sql_upper:
+            node_type = NodeType.UPDATE
+        elif "DELETE" in sql_upper:
+            node_type = NodeType.DELETE
+        elif "MERGE" in sql_upper:
+            node_type = NodeType.MERGE
+        else:
+            try:
+                parsed_stmt = sqlglot.parse_one(sql_text, dialect=dialect)
+                node_type = _classify_statement_type(parsed_stmt)
+            except Exception:
                 node_type = NodeType.UNKNOWN
 
         nodes.append(
@@ -1357,11 +1364,11 @@ def process_procedure_lineage(
         logger.info(f"   - Tracked {len(temp_tracker.temp_tables)} temp tables")
         logger.info(f"{'='*60}\n")
 
-        for mcp in flow.generate_mcps():
+        for mcp in flow.as_mcps():
             actual_graph.emit_mcp(mcp)
 
         for job in jobs:
-            for mcp in job.generate_mcps():
+            for mcp in job.as_mcps():
                 actual_graph.emit_mcp(mcp)
 
     finally:
