@@ -337,25 +337,41 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
         statement = sqlglot.parse_one(query_text, dialect=dialect)
 
         # Apply the same optimizations that DataHub's parser uses
-        optimized_statement = sqlglot.optimizer.qualify.qualify(
-            statement.copy(),
-            dialect=dialect,
-            catalog=default_db,
-            db=default_schema,
-            qualify_columns=False,
-            validate_qualify_columns=False,
-            allow_partial_qualification=True,
-            identify=False,
+        # Use the same optimization rules as DataHub (qualify + unnest_subqueries)
+        _OPTIMIZE_RULES = (
+            sqlglot.optimizer.optimizer.qualify,
+            sqlglot.optimizer.optimizer.unnest_subqueries,
         )
 
-        # Now optimize with unnest_subqueries to create internal CTEs
         try:
-            optimized_statement = sqlglot.optimizer.unnest_subqueries.unnest_subqueries(
-                optimized_statement,
+            optimized_statement = sqlglot.optimizer.optimizer.optimize(
+                statement.copy(),
                 dialect=dialect,
+                schema=None,  # We don't have schema info, but that's OK for structure
+                qualify_columns=False,  # Don't qualify columns without schema
+                validate_qualify_columns=False,
+                allow_partial_qualification=True,
+                identify=False,
+                catalog=default_db,
+                db=default_schema,
+                rules=_OPTIMIZE_RULES,
             )
+            logger.debug("✅ Successfully optimized SQL with unnest_subqueries")
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"Optimized SQL:\n{optimized_statement.sql(pretty=True, dialect=dialect)}")
         except Exception as e:
-            logger.debug(f"Failed to unnest subqueries: {e}")
+            logger.debug(f"⚠️ Optimization failed, using basic qualify: {e}")
+            # Fallback to basic qualify if optimize fails
+            optimized_statement = sqlglot.optimizer.qualify.qualify(
+                statement.copy(),
+                dialect=dialect,
+                catalog=default_db,
+                db=default_schema,
+                qualify_columns=False,
+                validate_qualify_columns=False,
+                allow_partial_qualification=True,
+                identify=False,
+            )
 
         # Extract CTE definitions from the optimized statement
         cte_definitions = {}
