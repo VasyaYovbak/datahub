@@ -30,6 +30,7 @@ from datahub.metadata.urns import DatasetUrn, QueryUrn, SchemaFieldUrn
 from datahub.sdk._utils import DEFAULT_ACTOR_URN
 from datahub.sdk.dataflow import DataFlow
 from datahub.sdk.datajob import DataJob
+from datahub.sdk.dataset import Dataset
 from datahub.sdk.main_client import DataHubClient
 from datahub.specific.dataset import DatasetPatchBuilder
 from datahub.sql_parsing.fingerprint_utils import generate_hash
@@ -822,15 +823,14 @@ def _extract_statements_from_text(procedure_sql: str, dialect: str) -> List[str]
 
     This is a fallback when sqlglot cannot parse the procedure structure.
     Extracts common DML/DDL statements from the procedure body.
+    Returns statements in the order they appear in the original code.
     """
-    statements = []
-
     procedure_body = procedure_sql
     begin_match = re.search(r'\bBEGIN\b', procedure_sql, re.IGNORECASE)
     end_match = re.search(r'\bEND\s*;?\s*\$\$', procedure_sql, re.IGNORECASE)
 
     if begin_match and end_match:
-        procedure_body = procedure_sql[begin_match.end():end_match.start()]
+        procedure_body = procedure_sql[begin_match.end() : end_match.start()]
         logger.debug(f"Extracted procedure body between BEGIN and END")
 
     patterns = [
@@ -848,24 +848,30 @@ def _extract_statements_from_text(procedure_sql: str, dialect: str) -> List[str]
         (r'MERGE\s+INTO\s+[\w.]+\s+.+?;', NodeType.MERGE),
     ]
 
+    all_matches = []
     for pattern, node_type in patterns:
         matches = re.finditer(pattern, procedure_body, re.IGNORECASE | re.DOTALL)
         for match in matches:
-            sql_text = match.group(0).strip()
+            all_matches.append((match.start(), match.group(0).strip(), node_type))
 
-            sql_text = re.sub(r'--[^\n]*', '', sql_text)
-            sql_text = re.sub(r'/\*.*?\*/', ' ', sql_text, flags=re.DOTALL)
+    all_matches.sort(key=lambda x: x[0])
 
-            sql_text = re.sub(r'\s+', ' ', sql_text)
+    statements = []
+    for start_pos, sql_text, node_type in all_matches:
+        sql_text = re.sub(r'--[^\n]*', '', sql_text)
+        sql_text = re.sub(r'/\*.*?\*/', ' ', sql_text, flags=re.DOTALL)
+        sql_text = re.sub(r'\s+', ' ', sql_text)
 
-            if not sql_text.endswith(';'):
-                sql_text += ';'
+        if not sql_text.endswith(';'):
+            sql_text += ';'
 
-            if sql_text and sql_text not in statements:
-                statements.append(sql_text)
-                logger.debug(f"  Extracted: {sql_text[:80]}...")
+        if sql_text and sql_text not in statements:
+            statements.append(sql_text)
+            logger.debug(f"  [{start_pos}] Extracted: {sql_text[:80]}...")
 
-    logger.info(f"📝 Regex extracted {len(statements)} statements from procedure body")
+    logger.info(
+        f"📝 Regex extracted {len(statements)} statements from procedure body (in order)"
+    )
     return statements
 
 
@@ -1127,8 +1133,10 @@ def _process_temp_table_creation_node(
     default_db: Optional[str],
     default_schema: Optional[str],
     dialect: sqlglot.Dialect,
+    expand_ctes: bool = True,
+    replace_aliases: bool = True,
 ) -> None:
-    """Process a CREATE TEMP TABLE node and register the temp table."""
+    """Process a CREATE TEMP TABLE node, create Dataset entity, and register temp table."""
     from datahub.sql_parsing.sqlglot_lineage import create_lineage_sql_parsed_result
 
     try:
@@ -1172,6 +1180,37 @@ def _process_temp_table_creation_node(
             graph=graph,
         )
 
+        optimized_statement = process_statement_as_datahub(
+            select_sql,
+            platform,
+            env,
+            graph,
+            platform_instance,
+            True,
+            default_db,
+            default_schema,
+        )
+
+        cte_definitions = {}
+        if expand_ctes:
+            cte_definitions = extract_ctes_from_optimized_sql(
+                optimized_statement, dialect
+            )
+
+        table_alias_to_urn: Dict[str, str] = {}
+        if replace_aliases:
+            try:
+                for table_ref in statement.find_all(exp.Table):
+                    table_alias = table_ref.alias_or_name
+                    table_name_str = table_ref.name
+
+                    for urn in parsed_result.in_tables:
+                        if table_name_str.lower() in urn.lower():
+                            table_alias_to_urn[table_alias] = urn
+                            break
+            except Exception as e:
+                logger.debug(f"Failed to extract table aliases: {e}")
+
         columns = {}
         if parsed_result.column_lineage:
             for col_lineage in parsed_result.column_lineage:
@@ -1182,15 +1221,63 @@ def _process_temp_table_creation_node(
                         if col_lineage.logic
                         else col_name
                     )
-                    columns[col_name] = source_expr
 
-        virtual_urn = f"urn:li:dataset:(urn:li:dataPlatform:{platform},temp.{table_name},{env})"
+                    enhanced_logic = source_expr
+                    if expand_ctes and cte_definitions:
+                        try:
+                            enhanced_logic = expand_cte_references_recursively(
+                                enhanced_logic, cte_definitions, dialect, max_depth=5
+                            )
+                        except Exception as e:
+                            logger.debug(f"Failed to expand CTEs for {col_name}: {e}")
+
+                    if replace_aliases and table_alias_to_urn:
+                        try:
+                            enhanced_logic = replace_table_aliases_with_names(
+                                enhanced_logic, table_alias_to_urn, dialect
+                            )
+                        except Exception as e:
+                            logger.debug(f"Failed to replace aliases for {col_name}: {e}")
+
+                    columns[col_name] = enhanced_logic
+
+        temp_table_urn = f"urn:li:dataset:(urn:li:dataPlatform:{platform},{default_db}.{default_schema}.{table_name},{env})"
+
+        temp_dataset = Dataset(
+            platform=platform,
+            name=f"{default_db}.{default_schema}.{table_name}",
+            env=env,
+            platform_instance=platform_instance,
+        )
+
+        schema_fields = []
+        for col_name, source_expr in columns.items():
+            schema_field = models.SchemaFieldClass(
+                fieldPath=col_name,
+                type=models.SchemaFieldDataTypeClass(type=models.StringTypeClass()),
+                nativeDataType="TEXT",
+                description=f"Source: {source_expr}",
+            )
+            schema_fields.append(schema_field)
+
+        if schema_fields:
+            schema_metadata = models.SchemaMetadataClass(
+                schemaName=table_name,
+                platform=f"urn:li:dataPlatform:{platform}",
+                version=0,
+                fields=schema_fields,
+                platformSchema=models.OtherSchemaClass(rawSchema=""),
+            )
+            temp_dataset._set_aspect(schema_metadata)
+
+        for mcp in temp_dataset.as_mcps():
+            graph.emit_mcp(mcp)
 
         temp_tracker.register_temp_table(
             table_name=table_name,
             columns=columns,
             created_in_node_id=node.node_id,
-            dataset_urn=virtual_urn,
+            dataset_urn=temp_table_urn,
         )
         temp_tracker.set_column_lineage(table_name, parsed_result)
 
@@ -1198,7 +1285,7 @@ def _process_temp_table_creation_node(
         node.lineage_result = parsed_result
 
         logger.info(
-            f"✅ Processed CREATE TEMP TABLE '{table_name}' with {len(columns)} columns"
+            f"✅ Created Dataset and processed CREATE TEMP TABLE '{table_name}' with {len(columns)} columns"
         )
 
     except Exception as e:
@@ -1295,6 +1382,8 @@ def process_procedure_lineage(
                     default_db,
                     default_schema,
                     dialect,
+                    expand_ctes=expand_ctes,
+                    replace_aliases=replace_aliases,
                 )
 
                 job = DataJob(
