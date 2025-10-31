@@ -1265,6 +1265,7 @@ def _process_temp_table_creation_node(
                 schemaName=table_name,
                 platform=f"urn:li:dataPlatform:{platform}",
                 version=0,
+                hash="",
                 fields=schema_fields,
                 platformSchema=models.OtherSchemaClass(rawSchema=""),
             )
