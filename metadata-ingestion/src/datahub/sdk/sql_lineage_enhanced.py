@@ -524,6 +524,7 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
     expand_ctes: bool = True,
     replace_aliases: bool = True,
     suppress_warnings: bool = True,
+    query_name: Optional[str] = None,
 ) -> None:
     """
     Add lineage with enhanced transformation logic that expands CTEs and replaces aliases.
@@ -546,6 +547,7 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
         expand_ctes: Whether to expand CTE references (default: True)
         replace_aliases: Whether to replace table aliases (default: True)
         suppress_warnings: Whether to suppress sqlglot warnings (default: True)
+        query_name: Optional human-readable name for the query (e.g., "calculate_rfm_scores_insert_1")
     """
     from datahub.sql_parsing.sqlglot_lineage import create_lineage_sql_parsed_result
 
@@ -665,18 +667,24 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
                         ).urn()
                         fields_involved.add(upstream_field)
 
+        query_properties = models.QueryPropertiesClass(
+            statement=models.QueryStatementClass(
+                value=query_text,
+                language=models.QueryLanguageClass.SQL,
+            ),
+            source=models.QuerySourceClass.SYSTEM,
+            created=_empty_audit_stamp,
+            lastModified=_empty_audit_stamp,
+        )
+
+        # Add name if provided
+        if query_name:
+            query_properties.name = query_name
+
         query_entity = MetadataChangeProposalWrapper.construct_many(
             query_urn,
             aspects=[
-                models.QueryPropertiesClass(
-                    statement=models.QueryStatementClass(
-                        value=query_text,
-                        language=models.QueryLanguageClass.SQL,
-                    ),
-                    source=models.QuerySourceClass.SYSTEM,
-                    created=_empty_audit_stamp,
-                    lastModified=_empty_audit_stamp,
-                ),
+                query_properties,
                 make_query_subjects(list(fields_involved)),
             ],
         )
@@ -1289,6 +1297,15 @@ def process_procedure_lineage(
 
         logger.info(f"📊 Created DataFlow for procedure: {flow.urn}")
 
+        # Track operation counts for naming
+        operation_counts = {
+            NodeType.INSERT: 0,
+            NodeType.UPDATE: 0,
+            NodeType.DELETE: 0,
+            NodeType.MERGE: 0,
+            NodeType.TRUNCATE: 0,
+        }
+
         jobs = []
         for node in nodes:
             logger.info(
@@ -1319,6 +1336,11 @@ def process_procedure_lineage(
                 NodeType.MERGE,
             ):
                 try:
+                    # Increment operation count and generate name
+                    operation_counts[node.node_type] += 1
+                    operation_name = node.node_type.value.lower()
+                    query_name = f"{procedure_name}_{operation_name}_{operation_counts[node.node_type]}"
+
                     # Wrap SQL with temp table CTEs for automatic expansion
                     wrapped_sql = _wrap_sql_with_temp_table_ctes(
                         node.sql_text, temp_tracker, dialect
@@ -1337,12 +1359,15 @@ def process_procedure_lineage(
                         expand_ctes=expand_ctes,
                         replace_aliases=replace_aliases,
                         suppress_warnings=suppress_warnings,
+                        query_name=query_name,
                     )
+
+                    logger.info(f"✅ Created SQL query with name: {query_name}")
 
                     job = DataJob(
                         name=f"{procedure_name}_node_{node.sequence_order}",
                         flow=flow,
-                        description=f"{node.node_type.value.upper()} operation",
+                        description=f"{node.node_type.value.upper()} operation - {query_name}",
                     )
                     jobs.append(job)
 
