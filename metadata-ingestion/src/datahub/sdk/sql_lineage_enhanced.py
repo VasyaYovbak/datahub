@@ -82,10 +82,10 @@ class TempTableInfo:
     """Information about a temporary table created during procedure execution."""
 
     table_name: str
+    select_sql: str  # The SELECT statement that creates the temp table
     columns: Dict[str, str] = field(default_factory=dict)  # column_name -> source_expr
     created_in_node_id: str = ""
-    dataset_urn: Optional[str] = None
-    column_lineage: Optional[SqlParsingResult] = None
+    cte_definition: Optional[CTEDefinition] = None  # Virtual CTE for this temp table
 
 
 @dataclass
@@ -113,21 +113,30 @@ class TempTableTracker:
     def register_temp_table(
         self,
         table_name: str,
+        select_sql: str,
         columns: Dict[str, str],
         created_in_node_id: str,
-        dataset_urn: Optional[str] = None,
     ) -> None:
-        """Register a new temporary table."""
+        """Register a new temporary table with its SELECT statement and column mappings."""
         normalized_name = table_name.lower()
+
+        # Create a virtual CTE definition for this temp table
+        cte_def = CTEDefinition(
+            name=table_name,
+            select_expression=select_sql,
+            column_mappings=columns,
+        )
+
         self.temp_tables[normalized_name] = TempTableInfo(
             table_name=table_name,
+            select_sql=select_sql,
             columns=columns,
             created_in_node_id=created_in_node_id,
-            dataset_urn=dataset_urn,
+            cte_definition=cte_def,
         )
         self._table_name_variations[normalized_name] = table_name
         logger.info(
-            f"📝 Registered temp table '{table_name}' with {len(columns)} columns"
+            f"📝 Registered temp table '{table_name}' with {len(columns)} columns as virtual CTE"
         )
 
     def is_temp_table(self, table_name: str) -> bool:
@@ -138,22 +147,13 @@ class TempTableTracker:
         """Get information about a temporary table."""
         return self.temp_tables.get(table_name.lower())
 
-    def resolve_column_source(
-        self, table_name: str, column_name: str
-    ) -> Optional[str]:
-        """Resolve the source expression for a temp table column."""
-        temp_table = self.get_temp_table(table_name)
-        if temp_table and column_name in temp_table.columns:
-            return temp_table.columns[column_name]
-        return None
-
-    def set_column_lineage(
-        self, table_name: str, lineage_result: SqlParsingResult
-    ) -> None:
-        """Store the column lineage result for a temp table."""
-        temp_table = self.get_temp_table(table_name)
-        if temp_table:
-            temp_table.column_lineage = lineage_result
+    def get_all_cte_definitions(self) -> Dict[str, CTEDefinition]:
+        """Get all temp tables as CTE definitions for expansion."""
+        return {
+            info.table_name: info.cte_definition
+            for info in self.temp_tables.values()
+            if info.cte_definition
+        }
 
 
 def assign_anonymous_projection_aliases(
@@ -1123,124 +1123,47 @@ def _extract_statements_from_function_body(
     return statements
 
 
-def _detect_temp_table_references(
-    sql_text: str, temp_tracker: TempTableTracker
-) -> List[str]:
+def _wrap_sql_with_temp_table_ctes(
+    sql_text: str, temp_tracker: TempTableTracker, dialect: str
+) -> str:
     """
-    Detect which temp tables are referenced in a SQL statement.
+    Wrap SQL with temp table definitions as CTEs.
 
-    Returns a list of temp table names found in the SQL.
+    This allows the existing CTE expansion logic to handle temp tables automatically.
+    Example:
+        Original: INSERT INTO target SELECT * FROM temp1
+        Wrapped:  WITH temp1 AS (SELECT ... FROM source1)
+                  INSERT INTO target SELECT * FROM temp1
     """
-    referenced_temps = []
-    for temp_name in temp_tracker.temp_tables.keys():
-        # Simple pattern matching - look for table name in FROM/JOIN clauses
-        pattern = rf'\b(?:FROM|JOIN)\s+{temp_name}\b'
-        if re.search(pattern, sql_text, re.IGNORECASE):
-            referenced_temps.append(temp_name)
-    return referenced_temps
+    if not temp_tracker.temp_tables:
+        return sql_text
 
+    # Build CTE definitions for all temp tables
+    cte_clauses = []
+    for temp_info in temp_tracker.temp_tables.values():
+        cte_clause = f"{temp_info.table_name} AS ({temp_info.select_sql})"
+        cte_clauses.append(cte_clause)
 
-def _expand_temp_table_lineage(
-    parsed_result: "SqlParsingResult",
-    temp_tracker: TempTableTracker,
-    referenced_temps: List[str],
-) -> "SqlParsingResult":
-    """
-    Expand lineage for temp table references.
+    if not cte_clauses:
+        return sql_text
 
-    When a query references temp tables, trace back to their ultimate source tables
-    and expand the column lineage accordingly.
-    """
-    if not referenced_temps or not parsed_result.column_lineage:
-        return parsed_result
+    # Wrap the SQL with CTEs
+    wrapped_sql = f"WITH {', '.join(cte_clauses)} {sql_text}"
 
-    from datahub.sql_parsing.sqlglot_lineage import SqlParsingResult, ColumnRef
-
-    # Build a mapping of temp table columns to their sources
-    temp_column_sources: Dict[str, List[ColumnRef]] = {}
-
-    for temp_name in referenced_temps:
-        temp_info = temp_tracker.get_temp_table(temp_name)
-        if not temp_info or not temp_info.column_lineage:
-            continue
-
-        # Extract source column mappings from the temp table's lineage
-        for col_lineage in temp_info.column_lineage.column_lineage:
-            if col_lineage.downstream and col_lineage.downstream.column:
-                temp_col_key = f"{temp_name}.{col_lineage.downstream.column}"
-                if temp_col_key not in temp_column_sources:
-                    temp_column_sources[temp_col_key] = []
-                temp_column_sources[temp_col_key].extend(col_lineage.upstreams)
-
-    # Now expand the current lineage
-    expanded_lineage = []
-    for col_lineage in parsed_result.column_lineage:
-        # Check if any upstream references a temp table
-        has_temp_ref = False
-        expanded_upstreams = []
-
-        for upstream_ref in col_lineage.upstreams:
-            if upstream_ref.table:
-                # Check if this table is a temp table
-                table_name = upstream_ref.table.split(".")[-1]  # Get just table name
-                is_temp = temp_tracker.is_temp_table(table_name)
-
-                if is_temp and upstream_ref.column:
-                    # Expand this temp table reference
-                    has_temp_ref = True
-                    temp_col_key = f"{table_name}.{upstream_ref.column}"
-
-                    if temp_col_key in temp_column_sources:
-                        # Add the ultimate sources
-                        expanded_upstreams.extend(temp_column_sources[temp_col_key])
-                        logger.debug(
-                            f"Expanded temp table reference {temp_col_key} to {len(temp_column_sources[temp_col_key])} source(s)"
-                        )
-                    else:
-                        # Keep original if we can't expand
-                        expanded_upstreams.append(upstream_ref)
-                else:
-                    # Not a temp table, keep original
-                    expanded_upstreams.append(upstream_ref)
-            else:
-                # No table specified, keep original
-                expanded_upstreams.append(upstream_ref)
-
-        # Create new column lineage with expanded upstreams
-        if has_temp_ref:
-            col_lineage.upstreams = expanded_upstreams
-            logger.info(
-                f"✅ Expanded temp table lineage for {col_lineage.downstream.column if col_lineage.downstream else 'unknown'}: "
-                f"{len(expanded_upstreams)} ultimate source(s)"
-            )
-
-        expanded_lineage.append(col_lineage)
-
-    parsed_result.column_lineage = expanded_lineage
-    return parsed_result
+    logger.debug(f"🔄 Wrapped SQL with {len(cte_clauses)} temp table CTE(s)")
+    return wrapped_sql
 
 
 def _process_temp_table_creation_node(
     node: ProcedureNode,
     temp_tracker: TempTableTracker,
-    platform: str,
-    env: str,
-    graph: DataHubGraph,
-    platform_instance: Optional[str],
-    default_db: Optional[str],
-    default_schema: Optional[str],
     dialect: sqlglot.Dialect,
-    expand_ctes: bool = True,
-    replace_aliases: bool = True,
 ) -> None:
     """
-    Process a CREATE TEMP TABLE node and register it in the tracker.
+    Process a CREATE TEMP TABLE node and register it in the tracker as a virtual CTE.
 
-    Does NOT create a Dataset entity for the temp table. Instead, stores column
-    lineage information for backward tracking when subsequent operations reference it.
+    Extracts the SELECT statement and column mappings without creating any entities.
     """
-    from datahub.sql_parsing.sqlglot_lineage import create_lineage_sql_parsed_result
-
     try:
         statement = sqlglot.parse_one(node.sql_text, dialect=dialect)
 
@@ -1262,314 +1185,44 @@ def _process_temp_table_creation_node(
 
         select_stmt = statement.expression
         if not select_stmt or not isinstance(select_stmt, exp.Select):
-            logger.warning(f"CREATE TEMP TABLE without SELECT, skipping lineage")
-            temp_tracker.register_temp_table(
-                table_name=table_name,
-                columns={},
-                created_in_node_id=node.node_id,
-            )
+            logger.warning(f"CREATE TEMP TABLE without SELECT, skipping")
             node.created_temp_tables.append(table_name)
             return
 
+        # Extract SELECT SQL
         select_sql = select_stmt.sql(dialect=dialect)
-        parsed_result: SqlParsingResult = create_lineage_sql_parsed_result(
-            query=select_sql,
-            default_db=default_db,
-            default_schema=default_schema,
-            platform=platform,
-            platform_instance=platform_instance,
-            env=env,
-            graph=graph,
-        )
 
-        optimized_statement = process_statement_as_datahub(
-            select_sql,
-            platform,
-            env,
-            graph,
-            platform_instance,
-            True,
-            default_db,
-            default_schema,
-        )
-
-        cte_definitions = {}
-        if expand_ctes:
-            cte_definitions = extract_ctes_from_optimized_sql(
-                optimized_statement, dialect
-            )
-
-        table_alias_to_urn: Dict[str, str] = {}
-        if replace_aliases:
-            try:
-                for table_ref in statement.find_all(exp.Table):
-                    table_alias = table_ref.alias_or_name
-                    table_name_str = table_ref.name
-
-                    for urn in parsed_result.in_tables:
-                        if table_name_str.lower() in urn.lower():
-                            table_alias_to_urn[table_alias] = urn
-                            break
-            except Exception as e:
-                logger.debug(f"Failed to extract table aliases: {e}")
-
+        # Extract column mappings from SELECT
         columns = {}
-        if parsed_result.column_lineage:
-            for col_lineage in parsed_result.column_lineage:
-                if col_lineage.downstream and col_lineage.downstream.column:
-                    col_name = col_lineage.downstream.column
-                    source_expr = (
-                        col_lineage.logic.column_logic
-                        if col_lineage.logic
-                        else col_name
-                    )
+        for i, select_col in enumerate(select_stmt.expressions):
+            col_name = select_col.alias_or_name
+            if not col_name or col_name == "*":
+                col_name = f"_col_{i}"
 
-                    enhanced_logic = source_expr
-                    if expand_ctes and cte_definitions:
-                        try:
-                            enhanced_logic = expand_cte_references_recursively(
-                                enhanced_logic, cte_definitions, dialect, max_depth=5
-                            )
-                        except Exception as e:
-                            logger.debug(f"Failed to expand CTEs for {col_name}: {e}")
+            # Get the expression for this column
+            if isinstance(select_col, exp.Alias):
+                col_expr = select_col.this
+            else:
+                col_expr = select_col
 
-                    if replace_aliases and table_alias_to_urn:
-                        try:
-                            enhanced_logic = replace_table_aliases_with_names(
-                                enhanced_logic, table_alias_to_urn, dialect
-                            )
-                        except Exception as e:
-                            logger.debug(f"Failed to replace aliases for {col_name}: {e}")
+            columns[col_name] = col_expr.sql(dialect=dialect)
 
-                    columns[col_name] = enhanced_logic
-
-        # Store temp table info WITHOUT creating a Dataset entity
-        # Temp tables are tracked only in memory for lineage expansion
+        # Register as virtual CTE
         temp_tracker.register_temp_table(
             table_name=table_name,
+            select_sql=select_sql,
             columns=columns,
             created_in_node_id=node.node_id,
-            dataset_urn=None,  # No Dataset entity for temp tables
         )
-        temp_tracker.set_column_lineage(table_name, parsed_result)
 
         node.created_temp_tables.append(table_name)
-        node.lineage_result = parsed_result
 
         logger.info(
-            f"✅ Created Dataset and processed CREATE TEMP TABLE '{table_name}' with {len(columns)} columns"
+            f"✅ Registered temp table '{table_name}' with {len(columns)} columns"
         )
 
     except Exception as e:
         logger.error(f"Failed to process temp table creation: {e}", exc_info=True)
-
-
-def _process_sql_with_temp_table_expansion(
-    *,
-    graph: DataHubGraph,
-    query_text: str,
-    platform: str,
-    platform_instance: Optional[str],
-    env: str,
-    default_db: Optional[str],
-    default_schema: Optional[str],
-    override_dialect: Optional[str],
-    expand_ctes: bool,
-    replace_aliases: bool,
-    suppress_warnings: bool,
-    temp_tracker: TempTableTracker,
-) -> None:
-    """
-    Process SQL with temp table reference expansion.
-
-    Detects temp table references, processes lineage normally, then expands
-    temp table references to trace back to ultimate source tables.
-    """
-    # Detect temp table references
-    referenced_temps = _detect_temp_table_references(query_text, temp_tracker)
-
-    if referenced_temps:
-        logger.info(
-            f"🔍 Detected {len(referenced_temps)} temp table reference(s): {referenced_temps}"
-        )
-
-    # For now, if temp tables are referenced, we need to handle schema resolution
-    # The SQL parser will try to resolve temp tables from DataHub, which won't exist
-    # We'll catch any errors and log warnings
-    try:
-        from datahub.sql_parsing.sqlglot_lineage import create_lineage_sql_parsed_result
-
-        # Parse the SQL query to get lineage
-        parsed_result: "SqlParsingResult" = create_lineage_sql_parsed_result(
-            query=query_text,
-            default_db=default_db,
-            default_schema=default_schema,
-            platform=platform,
-            platform_instance=platform_instance,
-            env=env,
-            graph=graph,
-            override_dialect=override_dialect,
-        )
-
-        # Expand temp table references if any were detected
-        if referenced_temps:
-            parsed_result = _expand_temp_table_lineage(
-                parsed_result, temp_tracker, referenced_temps
-            )
-
-        # Continue with normal lineage processing using the expanded result
-        # We need to emit the lineage manually since we've already parsed it
-        if parsed_result.out_tables:
-            downstream_urn = parsed_result.out_tables[0]
-
-            from datahub.metadata.urns import QueryUrn, SchemaFieldUrn
-            from datahub.sql_parsing.fingerprint_utils import generate_hash
-            from datahub.sql_parsing.sql_parsing_aggregator import make_query_subjects
-            from datahub.specific.dataset import DatasetPatchBuilder
-
-            query_urn = QueryUrn(generate_hash(query_text)).urn()
-
-            # Emit query entity
-            fields_involved = OrderedSet([str(downstream_urn)])
-            for upstream_table in parsed_result.in_tables:
-                if upstream_table != downstream_urn:
-                    fields_involved.add(str(upstream_table))
-
-            if parsed_result.column_lineage:
-                for col_lineage in parsed_result.column_lineage:
-                    if col_lineage.downstream and col_lineage.downstream.column:
-                        downstream_field = SchemaFieldUrn(
-                            downstream_urn, col_lineage.downstream.column
-                        ).urn()
-                        fields_involved.add(downstream_field)
-
-                    for upstream_ref in col_lineage.upstreams:
-                        if upstream_ref.table and upstream_ref.column:
-                            upstream_field = SchemaFieldUrn(
-                                upstream_ref.table, upstream_ref.column
-                            ).urn()
-                            fields_involved.add(upstream_field)
-
-            query_entity = MetadataChangeProposalWrapper.construct_many(
-                query_urn,
-                aspects=[
-                    models.QueryPropertiesClass(
-                        statement=models.QueryStatementClass(
-                            value=query_text,
-                            language=models.QueryLanguageClass.SQL,
-                        ),
-                        source=models.QuerySourceClass.SYSTEM,
-                        created=_empty_audit_stamp,
-                        lastModified=_empty_audit_stamp,
-                    ),
-                    make_query_subjects(list(fields_involved)),
-                ],
-            )
-
-            # Process each upstream table
-            for upstream_table in parsed_result.in_tables:
-                if upstream_table == downstream_urn:
-                    continue
-
-                # Skip temp tables - they don't exist as Datasets
-                table_name = upstream_table.split(".")[-1]
-                if temp_tracker.is_temp_table(table_name):
-                    logger.debug(
-                        f"Skipping temp table {table_name} in upstream lineage"
-                    )
-                    continue
-
-                fine_grained_lineages: List[models.FineGrainedLineageClass] = []
-
-                if parsed_result.column_lineage:
-                    for col_lineage in parsed_result.column_lineage:
-                        if not (
-                            col_lineage.downstream and col_lineage.downstream.column
-                        ):
-                            continue
-
-                        upstream_refs = [
-                            ref
-                            for ref in col_lineage.upstreams
-                            if ref.table == upstream_table and ref.column
-                        ]
-
-                        if not upstream_refs:
-                            continue
-
-                        # Extract transformation logic
-                        transform_operation = None
-                        if col_lineage.logic:
-                            raw_logic = col_lineage.logic.column_logic
-                            transform_operation = (
-                                f"COPY: {raw_logic}"
-                                if col_lineage.logic.is_direct_copy
-                                else f"SQL: {raw_logic}"
-                            )
-
-                        fine_grained_lineages.append(
-                            models.FineGrainedLineageClass(
-                                upstreamType=models.FineGrainedLineageUpstreamTypeClass.FIELD_SET,
-                                upstreams=[
-                                    SchemaFieldUrn(upstream_table, ref.column).urn()
-                                    for ref in upstream_refs
-                                ],
-                                downstreamType=models.FineGrainedLineageDownstreamTypeClass.FIELD,
-                                downstreams=[
-                                    SchemaFieldUrn(
-                                        downstream_urn, col_lineage.downstream.column
-                                    ).urn()
-                                ],
-                                transformOperation=transform_operation,
-                                query=query_urn,
-                                confidenceScore=parsed_result.debug_info.confidence,
-                            )
-                        )
-
-                # Build dataset patch
-                updater = DatasetPatchBuilder(str(downstream_urn))
-                updater.add_upstream_lineage(
-                    models.UpstreamClass(
-                        dataset=str(upstream_table),
-                        type=models.DatasetLineageTypeClass.TRANSFORMED,
-                        query=query_urn,
-                    )
-                )
-
-                for fgl in fine_grained_lineages:
-                    updater.add_fine_grained_upstream_lineage(fgl)
-
-                mcps = list(updater.build())
-                graph.emit_mcps(mcps)
-
-            # Emit query entity
-            if query_entity:
-                graph.emit_mcps(query_entity)
-
-            logger.info(
-                f"Successfully created lineage with {len(parsed_result.in_tables)} upstream table(s) "
-                f"and {len(parsed_result.column_lineage or [])} column lineage relationship(s)"
-            )
-
-    except Exception as e:
-        logger.warning(
-            f"Failed to process SQL with temp table expansion: {e}", exc_info=True
-        )
-        # Fallback to normal processing without expansion
-        logger.info("Falling back to standard lineage processing...")
-        infer_lineage_from_sql_with_enhanced_transformation_logic(
-            graph=graph,
-            query_text=query_text,
-            platform=platform,
-            platform_instance=platform_instance,
-            env=env,
-            default_db=default_db,
-            default_schema=default_schema,
-            override_dialect=override_dialect,
-            expand_ctes=expand_ctes,
-            replace_aliases=replace_aliases,
-            suppress_warnings=suppress_warnings,
-        )
 
 
 def process_procedure_lineage(
@@ -1652,34 +1305,12 @@ def process_procedure_lineage(
                 continue
 
             if node.node_type == NodeType.CREATE_TEMP_TABLE:
-                _process_temp_table_creation_node(
-                    node,
-                    temp_tracker,
-                    platform,
-                    env,
-                    actual_graph,
-                    platform_instance,
-                    default_db,
-                    default_schema,
-                    dialect,
-                    expand_ctes=expand_ctes,
-                    replace_aliases=replace_aliases,
+                # Just track the temp table - don't create DataJob for it
+                _process_temp_table_creation_node(node, temp_tracker, dialect)
+                logger.info(
+                    f"📝 Tracked temp table: {node.created_temp_tables}"
                 )
-
-                job = DataJob(
-                    name=f"{procedure_name}_node_{node.sequence_order}",
-                    flow=flow,
-                    description=f"Create temp table - {node.created_temp_tables}",
-                )
-
-                # Set inlets to source tables
-                if node.lineage_result and node.lineage_result.in_tables:
-                    job.set_inlets(list(node.lineage_result.in_tables))
-
-                # NOTE: No outlets set - temp tables are not Dataset entities
-                # Subsequent operations will trace back through temp_tracker
-
-                jobs.append(job)
+                continue
 
             elif node.node_type in (
                 NodeType.INSERT,
@@ -1688,10 +1319,15 @@ def process_procedure_lineage(
                 NodeType.MERGE,
             ):
                 try:
-                    # Use temp table expansion aware processing
-                    _process_sql_with_temp_table_expansion(
+                    # Wrap SQL with temp table CTEs for automatic expansion
+                    wrapped_sql = _wrap_sql_with_temp_table_ctes(
+                        node.sql_text, temp_tracker, dialect
+                    )
+
+                    # Process using standard lineage logic with CTE expansion
+                    infer_lineage_from_sql_with_enhanced_transformation_logic(
                         graph=actual_graph,
-                        query_text=node.sql_text,
+                        query_text=wrapped_sql,
                         platform=platform,
                         platform_instance=platform_instance,
                         env=env,
@@ -1701,7 +1337,6 @@ def process_procedure_lineage(
                         expand_ctes=expand_ctes,
                         replace_aliases=replace_aliases,
                         suppress_warnings=suppress_warnings,
-                        temp_tracker=temp_tracker,
                     )
 
                     job = DataJob(
