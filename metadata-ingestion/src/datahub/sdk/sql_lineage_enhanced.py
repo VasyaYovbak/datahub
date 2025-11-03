@@ -844,16 +844,16 @@ def _extract_statements_from_text(procedure_sql: str, dialect: str) -> List[str]
     patterns = [
         (r'TRUNCATE\s+TABLE\s+[\w.]+\s*;', NodeType.TRUNCATE),
         (
-            r'CREATE\s+(?:TEMP|TEMPORARY)\s+TABLE\s+[\w.]+\s+AS\s+SELECT\s+.+?(?=(?:CREATE|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|GET\s+DIAGNOSTICS|RETURN|\Z))',
+            r'CREATE\s+(?:TEMP|TEMPORARY)\s+TABLE\s+[\w.]+(?:\s+AS)?\s+[\s\S]+?;',
             NodeType.CREATE_TEMP_TABLE,
         ),
         (
-            r'INSERT\s+INTO\s+[\w.]+\s*\([^)]*\)\s+SELECT\s+.+?(?=(?:CREATE|INSERT|UPDATE|DELETE|MERGE|TRUNCATE|GET\s+DIAGNOSTICS|RETURN|\Z))',
+            r'INSERT\s+INTO\s+[\w.]+\s*\([^)]*\)\s+SELECT\s+[\s\S]+?;',
             NodeType.INSERT,
         ),
-        (r'UPDATE\s+[\w.]+\s+SET\s+.+?;', NodeType.UPDATE),
-        (r'DELETE\s+FROM\s+[\w.]+\s+.+?;', NodeType.DELETE),
-        (r'MERGE\s+INTO\s+[\w.]+\s+.+?;', NodeType.MERGE),
+        (r'UPDATE\s+[\w.]+\s+SET\s+[\s\S]+?;', NodeType.UPDATE),
+        (r'DELETE\s+FROM\s+[\w.]+[\s\S]+?;', NodeType.DELETE),
+        (r'MERGE\s+INTO\s+[\w.]+\s+[\s\S]+?;', NodeType.MERGE),
     ]
 
     all_matches = []
@@ -1356,12 +1356,12 @@ def process_procedure_lineage(
                 NodeType.DELETE,
                 NodeType.MERGE,
             ):
-                try:
-                    # Increment operation count and generate name
-                    operation_counts[node.node_type] += 1
-                    operation_name = node.node_type.value.lower()
-                    query_name = f"{procedure_name}_{operation_name}_{operation_counts[node.node_type]}"
+                # Increment operation count and generate name
+                operation_counts[node.node_type] += 1
+                operation_name = node.node_type.value.lower()
+                query_name = f"{procedure_name}_{operation_name}_{operation_counts[node.node_type]}"
 
+                try:
                     # Wrap SQL with temp table CTEs for automatic expansion
                     wrapped_sql = _wrap_sql_with_temp_table_ctes(
                         node.sql_text, temp_tracker, dialect
@@ -1390,17 +1390,19 @@ def process_procedure_lineage(
 
                     logger.info(f"✅ Created SQL query with name: {query_name}")
 
-                    job = DataJob(
-                        name=f"{procedure_name}_node_{node.sequence_order}",
-                        flow=flow,
-                        description=f"{node.node_type.value.upper()} operation - {query_name}",
-                    )
-                    jobs.append(job)
-
                 except Exception as e:
                     logger.warning(
-                        f"Failed to process lineage for node {node.sequence_order}: {e}"
+                        f"Column-level lineage failed for {query_name}: {e.__class__.__name__}"
                     )
+                    logger.info(f"⚠️ Created query entity without column lineage: {query_name}")
+
+                # Always create DataJob even if lineage fails
+                job = DataJob(
+                    name=f"{procedure_name}_node_{node.sequence_order}",
+                    flow=flow,
+                    description=f"{node.node_type.value.upper()} operation - {query_name}",
+                )
+                jobs.append(job)
 
             elif node.node_type == NodeType.TRUNCATE:
                 job = DataJob(
