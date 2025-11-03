@@ -1131,6 +1131,18 @@ def _extract_statements_from_function_body(
     return statements
 
 
+def _add_query_name_comment(sql_text: str, query_name: str) -> str:
+    """
+    Add a comment header with the query name to SQL text.
+
+    Example:
+        Input: "SELECT * FROM table"
+        Output: "-- Query: my_query_name\nSELECT * FROM table"
+    """
+    comment = f"-- Query: {query_name}\n"
+    return comment + sql_text
+
+
 def _wrap_sql_with_temp_table_ctes(
     sql_text: str, temp_tracker: TempTableTracker, dialect: str
 ) -> str:
@@ -1158,8 +1170,17 @@ def _wrap_sql_with_temp_table_ctes(
     # Wrap the SQL with CTEs
     wrapped_sql = f"WITH {', '.join(cte_clauses)} {sql_text}"
 
-    logger.debug(f"🔄 Wrapped SQL with {len(cte_clauses)} temp table CTE(s)")
-    return wrapped_sql
+    # Parse and format the entire statement for better readability
+    try:
+        parsed = sqlglot.parse_one(wrapped_sql, dialect=dialect)
+        formatted_sql = parsed.sql(dialect=dialect, pretty=True)
+        logger.debug(f"🔄 Wrapped and formatted SQL with {len(cte_clauses)} temp table CTE(s)")
+        return formatted_sql
+    except Exception as e:
+        logger.warning(f"Failed to parse wrapped SQL for formatting: {e}")
+        # Return the unformatted wrapped SQL as fallback
+        logger.debug(f"🔄 Wrapped SQL with {len(cte_clauses)} temp table CTE(s) (unformatted)")
+        return wrapped_sql
 
 
 def _process_temp_table_creation_node(
@@ -1346,10 +1367,15 @@ def process_procedure_lineage(
                         node.sql_text, temp_tracker, dialect
                     )
 
+                    # Add query name as comment header
+                    wrapped_sql_with_comment = _add_query_name_comment(
+                        wrapped_sql, query_name
+                    )
+
                     # Process using standard lineage logic with CTE expansion
                     infer_lineage_from_sql_with_enhanced_transformation_logic(
                         graph=actual_graph,
-                        query_text=wrapped_sql,
+                        query_text=wrapped_sql_with_comment,
                         platform=platform,
                         platform_instance=platform_instance,
                         env=env,
