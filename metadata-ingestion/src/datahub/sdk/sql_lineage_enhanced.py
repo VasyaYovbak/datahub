@@ -207,11 +207,11 @@ def extract_ctes_from_optimized_sql(
                     else:
                         col_expr = select_col
 
-                    column_mappings[col_name] = col_expr.sql(dialect=dialect)
+                    column_mappings[col_name] = col_expr.sql(dialect=dialect, pretty=True)
 
         ctes[cte_name] = CTEDefinition(
             name=cte_name,
-            select_expression=cte_query.sql(dialect=dialect),
+            select_expression=cte_query.sql(dialect=dialect, pretty=True),
             column_mappings=column_mappings,
         )
 
@@ -232,12 +232,12 @@ def extract_ctes_from_optimized_sql(
                         else:
                             col_expr = select_col
 
-                        column_mappings[col_name] = col_expr.sql(dialect=dialect)
+                        column_mappings[col_name] = col_expr.sql(dialect=dialect, pretty=True)
 
                 # Store as a "virtual CTE"
                 ctes[subquery_alias] = CTEDefinition(
                     name=subquery_alias,
-                    select_expression=subquery_expr.sql(dialect=dialect),
+                    select_expression=subquery_expr.sql(dialect=dialect, pretty=True),
                     column_mappings=column_mappings,
                 )
 
@@ -352,9 +352,9 @@ def expand_cte_references_recursively(
         if isinstance(result, exp.Alias):
             result = result.this
 
-        result_sql = result.sql(dialect=dialect)
+        result_sql = result.sql(dialect=dialect, pretty=True)
     else:
-        result_sql = expr.sql(dialect=dialect)
+        result_sql = expr.sql(dialect=dialect, pretty=True)
 
     # If we made changes, recursively expand again (for nested CTEs)
     if changed and max_depth > 1:
@@ -404,9 +404,9 @@ def replace_table_aliases_with_names(
         result = expr.expressions[0]
         if isinstance(result, exp.Alias):
             result = result.this
-        result_sql = result.sql(dialect=dialect)
+        result_sql = result.sql(dialect=dialect, pretty=True)
     else:
-        result_sql = expr.sql(dialect=dialect)
+        result_sql = expr.sql(dialect=dialect, pretty=True)
 
     return result_sql
 
@@ -1019,7 +1019,7 @@ def parse_procedure_to_nodes(
                             ProcedureNode(
                                 node_id=f"node_{sequence}",
                                 node_type=node_type,
-                                sql_text=stmt.sql(dialect=dialect),
+                                sql_text=stmt.sql(dialect=dialect, pretty=True),
                                 sequence_order=sequence,
                             )
                         )
@@ -1034,14 +1034,14 @@ def parse_procedure_to_nodes(
                     ProcedureNode(
                         node_id=f"node_{sequence}",
                         node_type=node_type,
-                        sql_text=statement.sql(dialect=dialect),
+                        sql_text=statement.sql(dialect=dialect, pretty=True),
                         sequence_order=sequence,
                     )
                 )
                 sequence += 1
 
         elif isinstance(statement, exp.Command):
-            sql_text = statement.sql(dialect=dialect)
+            sql_text = statement.sql(dialect=dialect, pretty=True)
             node_type = _classify_statement_type(statement)
             nodes.append(
                 ProcedureNode(
@@ -1059,7 +1059,7 @@ def parse_procedure_to_nodes(
                 ProcedureNode(
                     node_id=f"node_{sequence}",
                     node_type=node_type,
-                    sql_text=statement.sql(dialect=dialect),
+                    sql_text=statement.sql(dialect=dialect, pretty=True),
                     sequence_order=sequence,
                 )
             )
@@ -1190,7 +1190,7 @@ def _process_temp_table_creation_node(
             return
 
         # Extract SELECT SQL
-        select_sql = select_stmt.sql(dialect=dialect)
+        select_sql = select_stmt.sql(dialect=dialect, pretty=True)
 
         # Extract column mappings from SELECT
         columns = {}
@@ -1205,7 +1205,7 @@ def _process_temp_table_creation_node(
             else:
                 col_expr = select_col
 
-            columns[col_name] = col_expr.sql(dialect=dialect)
+            columns[col_name] = col_expr.sql(dialect=dialect, pretty=True)
 
         # Register as virtual CTE
         temp_tracker.register_temp_table(
