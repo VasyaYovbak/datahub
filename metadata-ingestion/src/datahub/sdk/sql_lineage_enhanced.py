@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import logging
 import re
-import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
@@ -30,7 +29,6 @@ from datahub.metadata.urns import DatasetUrn, QueryUrn, SchemaFieldUrn
 from datahub.sdk._utils import DEFAULT_ACTOR_URN
 from datahub.sdk.dataflow import DataFlow
 from datahub.sdk.datajob import DataJob
-from datahub.sdk.dataset import Dataset
 from datahub.sdk.main_client import DataHubClient
 from datahub.specific.dataset import DatasetPatchBuilder
 from datahub.sql_parsing.fingerprint_utils import generate_hash
@@ -309,7 +307,7 @@ def expand_cte_references_recursively(
                         # Replace the column reference
                         col_ref.replace(replacement_expr.copy())
                         changed = True
-                        logger.debug(f"      ✅ Replaced successfully")
+                        logger.debug("      ✅ Replaced successfully")
                 except Exception as e:
                     logger.debug(f"      ❌ Failed to expand: {e}")
             else:
@@ -337,7 +335,7 @@ def expand_cte_references_recursively(
                             # Replace the column reference
                             col_ref.replace(replacement_expr.copy())
                             changed = True
-                            logger.debug(f"      ✅ Replaced successfully")
+                            logger.debug("      ✅ Replaced successfully")
                     except Exception as e:
                         logger.debug(f"      ❌ Failed to expand: {e}")
         else:
@@ -411,6 +409,111 @@ def replace_table_aliases_with_names(
     return result_sql
 
 
+def _is_complex_subquery(sql_text: str, dialect: sqlglot.Dialect) -> bool:
+    """
+    Check if the SQL text represents a complex subquery.
+
+    A complex subquery is one that:
+    - Is wrapped in parentheses
+    - Contains a SELECT statement
+    - Has multiple tables or joins
+    """
+    try:
+        stripped = sql_text.strip()
+
+        # Check if it looks like a subquery (wrapped in parentheses)
+        if not (stripped.startswith("(") and stripped.endswith(")")):
+            return False
+
+        # Try to parse it
+        inner_sql = stripped[1:-1].strip()
+        parsed = sqlglot.parse_one(inner_sql, dialect=dialect)
+
+        if not isinstance(parsed, exp.Select):
+            return False
+
+        # Check if it has joins or multiple tables
+        tables = list(parsed.find_all(exp.Table))
+        joins = list(parsed.find_all(exp.Join))
+
+        # Consider it complex if it has joins or multiple tables
+        return len(joins) > 0 or len(tables) > 1
+
+    except Exception:
+        return False
+
+
+def _generate_simplified_subquery(sql_text: str, dialect: sqlglot.Dialect) -> Optional[str]:
+    """
+    Generate a simplified representation of a complex subquery.
+
+    Format: Subquery: SELECT {columns} FROM {tables} WHERE [conditions] [GROUP BY ...]
+
+    Example:
+        Input: (SELECT p.category FROM orders o JOIN products p ...)
+        Output: Subquery: SELECT category FROM orders, products WHERE [conditions]
+    """
+    try:
+        stripped = sql_text.strip()
+
+        # Remove outer parentheses
+        if stripped.startswith("(") and stripped.endswith(")"):
+            inner_sql = stripped[1:-1].strip()
+        else:
+            inner_sql = stripped
+
+        # Parse the subquery
+        parsed = sqlglot.parse_one(inner_sql, dialect=dialect)
+
+        if not isinstance(parsed, exp.Select):
+            return None
+
+        # Extract target columns
+        select_cols = []
+        for col_expr in parsed.expressions:
+            col_name = col_expr.alias_or_name
+            if col_name and col_name != "*":
+                # Just use the column name without table prefix for simplicity
+                if "." in col_name:
+                    col_name = col_name.split(".")[-1]
+                select_cols.append(col_name)
+
+        # Extract table names
+        tables = []
+        for table in parsed.find_all(exp.Table):
+            table_name = table.name
+            if table_name:
+                tables.append(table_name)
+
+        # Check for WHERE clause
+        has_where = parsed.args.get("where") is not None
+        where_text = " WHERE [conditions]" if has_where else ""
+
+        # Check for GROUP BY clause
+        has_group_by = parsed.args.get("group") is not None
+        group_text = " GROUP BY [...]" if has_group_by else ""
+
+        # Check for ORDER BY clause
+        has_order_by = parsed.args.get("order") is not None
+        order_text = " ORDER BY [...]" if has_order_by else ""
+
+        # Check for LIMIT clause
+        has_limit = parsed.args.get("limit") is not None
+        limit_text = " LIMIT [...]" if has_limit else ""
+
+        # Build simplified version
+        select_part = ", ".join(select_cols) if select_cols else "*"
+        from_part = ", ".join(tables) if tables else "[tables]"
+
+        simplified = f"Subquery: SELECT {select_part} FROM {from_part}{where_text}{group_text}{order_text}{limit_text}"
+
+        return simplified
+
+    except Exception as e:
+        logger.debug(f"Failed to generate simplified subquery: {e}")
+        return None
+
+
 def process_statement_as_datahub(
     sql,
     platform: str,
@@ -422,20 +525,20 @@ def process_statement_as_datahub(
     default_schema: str | None = None,
 ):
     from datahub.sql_parsing.sqlglot_lineage import (
+        SQL_LINEAGE_TIMEOUT_ENABLED,
+        SQL_LINEAGE_TIMEOUT_SECONDS,
+        SQL_PARSER_TRACE,
+        SchemaInfo,
         _normalize_db_or_schema,
-        parse_statement,
+        _prepare_query_columns,
         _simplify_select_into,
         _table_level_lineage,
         _TableName,
-        SchemaInfo,
-        create_schema_resolver,
-        _prepare_query_columns,
         _try_extract_select,
-        get_dialect,
-        SQL_PARSER_TRACE,
         cooperative_timeout,
-        SQL_LINEAGE_TIMEOUT_SECONDS,
-        SQL_LINEAGE_TIMEOUT_ENABLED,
+        create_schema_resolver,
+        get_dialect,
+        parse_statement,
         sqlglot,
     )
 
@@ -735,7 +838,7 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
                                         f"  After CTE expansion: {enhanced_logic}"
                                     )
                                 else:
-                                    logger.info(f"  ⚠️ CTE expansion: no changes made")
+                                    logger.info("  ⚠️ CTE expansion: no changes made")
                             except Exception as e:
                                 logger.warning(f"  ❌ Failed to expand CTEs: {e}")
 
@@ -761,7 +864,23 @@ def infer_lineage_from_sql_with_enhanced_transformation_logic(
                         if col_lineage.logic.is_direct_copy:
                             transform_operation = f"COPY: {enhanced_logic}"
                         else:
-                            transform_operation = f"SQL: {enhanced_logic}"
+                            # Check if this is a complex subquery that should be simplified
+                            if _is_complex_subquery(enhanced_logic, dialect):
+                                simplified = _generate_simplified_subquery(enhanced_logic, dialect)
+                                if simplified:
+                                    # Format as: simplified version + separator + original version
+                                    transform_operation = (
+                                        f"SQL: {simplified}\n\n"
+                                        f"-- Original representation:\n\n"
+                                        f"SQL: {enhanced_logic}"
+                                    )
+                                    logger.info("  📝 Generated simplified + original representation")
+                                else:
+                                    # Fallback if simplification fails
+                                    transform_operation = f"SQL: {enhanced_logic}"
+                            else:
+                                # Not a complex subquery, use standard format
+                                transform_operation = f"SQL: {enhanced_logic}"
 
                     fine_grained_lineages.append(
                         models.FineGrainedLineageClass(
@@ -839,7 +958,7 @@ def _extract_statements_from_text(procedure_sql: str, dialect: str) -> List[str]
 
     if begin_match and end_match:
         procedure_body = procedure_sql[begin_match.end() : end_match.start()]
-        logger.debug(f"Extracted procedure body between BEGIN and END")
+        logger.debug("Extracted procedure body between BEGIN and END")
 
     patterns = [
         (r'TRUNCATE\s+TABLE\s+[\w.]+\s*;', NodeType.TRUNCATE),
@@ -897,7 +1016,7 @@ def _parse_statements_with_regex_fallback(
         if params_text:
             nodes.append(
                 ProcedureNode(
-                    node_id=f"node_0_start",
+                    node_id="node_0_start",
                     node_type=NodeType.PROCEDURE_START,
                     sql_text=f"-- Parameters: {params_text}",
                     sequence_order=0,
@@ -1209,12 +1328,12 @@ def _process_temp_table_creation_node(
                     table_name = statement.this.this.name
 
         if not table_name:
-            logger.warning(f"Could not extract table name from CREATE statement")
+            logger.warning("Could not extract table name from CREATE statement")
             return
 
         select_stmt = statement.expression
         if not select_stmt or not isinstance(select_stmt, exp.Select):
-            logger.warning(f"CREATE TEMP TABLE without SELECT, skipping")
+            logger.warning("CREATE TEMP TABLE without SELECT, skipping")
             node.created_temp_tables.append(table_name)
             return
 
@@ -1408,7 +1527,7 @@ def process_procedure_lineage(
                 job = DataJob(
                     name=f"{procedure_name}_node_{node.sequence_order}",
                     flow=flow,
-                    description=f"TRUNCATE operation",
+                    description="TRUNCATE operation",
                 )
                 jobs.append(job)
 
