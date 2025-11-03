@@ -447,11 +447,11 @@ def _generate_simplified_subquery(sql_text: str, dialect: sqlglot.Dialect) -> Op
     """
     Generate a simplified representation of a complex subquery.
 
-    Format: Subquery: SELECT {columns} FROM {tables} WHERE [conditions] [GROUP BY ...]
+    Format: Subquery: SELECT {columns} FROM {tables} WHERE {actual_conditions} GROUP BY {actual_grouping}
 
     Example:
-        Input: (SELECT p.category FROM orders o JOIN products p ...)
-        Output: Subquery: SELECT category FROM orders, products WHERE [conditions]
+        Input: (SELECT p.category FROM orders o JOIN products p WHERE o.date = '2024-01-01' GROUP BY p.category)
+        Output: Subquery: SELECT category FROM orders, products WHERE o.date = '2024-01-01' GROUP BY p.category
     """
     try:
         stripped = sql_text.strip()
@@ -485,23 +485,35 @@ def _generate_simplified_subquery(sql_text: str, dialect: sqlglot.Dialect) -> Op
             if table_name:
                 tables.append(table_name)
 
-        # Check for WHERE clause
-        has_where = parsed.args.get("where") is not None
-        where_text = " WHERE [conditions]" if has_where else ""
+        # Extract actual WHERE clause
+        where_text = ""
+        if parsed.args.get("where") is not None:
+            where_expr = parsed.args["where"]
+            where_sql = where_expr.sql(dialect=dialect)
+            where_text = f" {where_sql}"
 
-        # Check for GROUP BY clause
-        has_group_by = parsed.args.get("group") is not None
-        group_text = " GROUP BY [...]" if has_group_by else ""
+        # Extract actual GROUP BY clause
+        group_text = ""
+        if parsed.args.get("group") is not None:
+            group_expr = parsed.args["group"]
+            group_sql = group_expr.sql(dialect=dialect)
+            group_text = f" {group_sql}"
 
-        # Check for ORDER BY clause
-        has_order_by = parsed.args.get("order") is not None
-        order_text = " ORDER BY [...]" if has_order_by else ""
+        # Extract actual ORDER BY clause
+        order_text = ""
+        if parsed.args.get("order") is not None:
+            order_expr = parsed.args["order"]
+            order_sql = order_expr.sql(dialect=dialect)
+            order_text = f" {order_sql}"
 
-        # Check for LIMIT clause
-        has_limit = parsed.args.get("limit") is not None
-        limit_text = " LIMIT [...]" if has_limit else ""
+        # Extract actual LIMIT clause
+        limit_text = ""
+        if parsed.args.get("limit") is not None:
+            limit_expr = parsed.args["limit"]
+            limit_sql = limit_expr.sql(dialect=dialect)
+            limit_text = f" {limit_sql}"
 
-        # Build simplified version
+        # Build simplified version with actual clauses
         select_part = ", ".join(select_cols) if select_cols else "*"
         from_part = ", ".join(tables) if tables else "[tables]"
 
@@ -1271,35 +1283,32 @@ def _wrap_sql_with_temp_table_ctes(
     This allows the existing CTE expansion logic to handle temp tables automatically.
     Example:
         Original: INSERT INTO target SELECT * FROM temp1
-        Wrapped:  WITH temp1 AS (SELECT ... FROM source1)
+        Wrapped:  WITH temp1 AS (
+                    SELECT ... FROM source1
+                  )
                   INSERT INTO target SELECT * FROM temp1
     """
     if not temp_tracker.temp_tables:
         return sql_text
 
-    # Build CTE definitions for all temp tables
-    cte_clauses = []
+    # Build CTE definitions for all temp tables, preserving their formatting
+    cte_parts = []
     for temp_info in temp_tracker.temp_tables.values():
-        cte_clause = f"{temp_info.table_name} AS ({temp_info.select_sql})"
-        cte_clauses.append(cte_clause)
+        # Format each CTE nicely with indentation
+        cte_part = f"{temp_info.table_name} AS (\n  {temp_info.select_sql}\n)"
+        cte_parts.append(cte_part)
 
-    if not cte_clauses:
+    if not cte_parts:
         return sql_text
 
-    # Wrap the SQL with CTEs
-    wrapped_sql = f"WITH {', '.join(cte_clauses)} {sql_text}"
+    # Join CTEs with commas and newlines
+    cte_section = ",\n".join(cte_parts)
 
-    # Parse and format the entire statement for better readability
-    try:
-        parsed = sqlglot.parse_one(wrapped_sql, dialect=dialect)
-        formatted_sql = parsed.sql(dialect=dialect, pretty=True)
-        logger.debug(f"🔄 Wrapped and formatted SQL with {len(cte_clauses)} temp table CTE(s)")
-        return formatted_sql
-    except Exception as e:
-        logger.warning(f"Failed to parse wrapped SQL for formatting: {e}")
-        # Return the unformatted wrapped SQL as fallback
-        logger.debug(f"🔄 Wrapped SQL with {len(cte_clauses)} temp table CTE(s) (unformatted)")
-        return wrapped_sql
+    # Wrap the SQL with CTEs, keeping original SQL formatting
+    wrapped_sql = f"WITH {cte_section}\n{sql_text}"
+
+    logger.debug(f"🔄 Wrapped SQL with {len(cte_parts)} temp table CTE(s)")
+    return wrapped_sql
 
 
 def _process_temp_table_creation_node(
